@@ -6,7 +6,7 @@ from typing import Any
 
 from glmocr import GlmOcr
 
-SUPPORTED_EXTENSIONS = {".pdf"}
+SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".png"}
 
 
 @dataclass(slots=True)

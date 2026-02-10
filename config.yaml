@@ -8,5 +8,38 @@ pipeline:
     api_path: /api/generate  # Use Ollama native endpoint
     model: glm-ocr:latest    # Required: specify model name
     api_mode: ollama_generate  # Required: use Ollama native format
+
+  page_loader:
+    # Generation parameters
+    max_tokens: 10240
+    temperature: 0.8
+    top_p: 0.9
+    top_k: 50
+    repetition_penalty: 1.1
+
+    # Image processing
+    t_patch_size: 2
+    patch_expand_factor: 1
+    image_expect_length: 10240
+    image_format: JPEG # JPEG, PNG, WEBP
+    min_pixels: 12544 # 112 * 112
+    max_pixels: 71372800 # 14 * 14 * 4 * 1280
+
+    # Default prompt for OCR (used when no custom prompt provided)
+    default_prompt: >
+      Recognize the text in the image and output in Markdown format.
+      Preserve the original layout (headings/paragraphs/tables/formulas).
+      Do not fabricate content that does not exist in the image.
+
+    # Task-specific prompts (used in layout mode)
+    task_prompt_mapping:
+      text: "Text Recognition:"
+      table: "Table Recognition:"
+      formula: "Formula Recognition:"
+
+    # PDF processing (pypdfium2 only)
+    pdf_dpi: 200
+    pdf_max_pages: null # null = no limit
+    pdf_verbose: false
   
   enable_layout: false  # Recommended for initial testing

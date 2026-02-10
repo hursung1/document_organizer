@@ -64,6 +64,14 @@ class MilvusStore:
                     "Existing Milvus collection schema is incompatible. "
                     "Expected text/vector/sparse_vector fields for hybrid search."
                 )
+            text_field = next(f for f in collection.schema.fields if f.name == TEXT_FIELD)
+            analyzer_enabled = bool(text_field.params.get("enable_analyzer"))
+            if not analyzer_enabled:
+                raise RuntimeError(
+                    "Existing Milvus collection is missing text analyzer "
+                    "(text.enable_analyzer=true required for BM25). "
+                    "Drop/recreate the collection or use a new collection name."
+                )
             self._collection = collection
             return collection
 
@@ -71,7 +79,12 @@ class MilvusStore:
             FieldSchema(name="pk", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=2048),
             FieldSchema(name="chunk_id", dtype=DataType.INT64),
-            FieldSchema(name=TEXT_FIELD, dtype=DataType.VARCHAR, max_length=65535),
+            FieldSchema(
+                name=TEXT_FIELD,
+                dtype=DataType.VARCHAR,
+                max_length=65535,
+                enable_analyzer=True,
+            ),
             FieldSchema(name="metadata", dtype=DataType.VARCHAR, max_length=65535),
             FieldSchema(name=DENSE_VECTOR_FIELD, dtype=DataType.FLOAT_VECTOR, dim=dim),
             FieldSchema(name=SPARSE_VECTOR_FIELD, dtype=DataType.SPARSE_FLOAT_VECTOR),

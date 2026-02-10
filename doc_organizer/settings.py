@@ -23,6 +23,17 @@ class IngestionSettings:
     dense_weight: float = 0.7
     sparse_weight: float = 0.3
     qa_model: str = "qwen3:latest"
+    redis_url: str = "redis://localhost:6379/0"
+    arxiv_storage_dir: Path = Path("results/arxiv")
+    arxiv_collection_name: str = "arxiv_papers"
+    arxiv_schedule_hour: int = 9
+    arxiv_max_results_per_topic: int = 50
+    arxiv_topics: tuple[str, ...] = (
+        "computer science",
+        "artificial intelligence",
+        "large language model",
+        "LLM",
+    )
 
     @classmethod
     def from_env(cls) -> IngestionSettings:
@@ -43,8 +54,22 @@ class IngestionSettings:
             dense_weight=float(os.getenv("DENSE_WEIGHT", "0.7")),
             sparse_weight=float(os.getenv("SPARSE_WEIGHT", "0.3")),
             qa_model=os.getenv("QA_MODEL", "qwen3:latest"),
+            redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            arxiv_storage_dir=Path(os.getenv("ARXIV_STORAGE_DIR", "results/arxiv")),
+            arxiv_collection_name=os.getenv("ARXIV_COLLECTION", "arxiv_papers"),
+            arxiv_schedule_hour=int(os.getenv("ARXIV_SCHEDULE_HOUR", "9")),
+            arxiv_max_results_per_topic=int(os.getenv("ARXIV_MAX_RESULTS_PER_TOPIC", "50")),
+            arxiv_topics=tuple(
+                topic.strip()
+                for topic in os.getenv(
+                    "ARXIV_TOPICS",
+                    "computer science,artificial intelligence,large language model,LLM",
+                ).split(",")
+                if topic.strip()
+            ),
         )
 
     def ensure_directories(self) -> None:
         self.docs_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.arxiv_storage_dir.mkdir(parents=True, exist_ok=True)

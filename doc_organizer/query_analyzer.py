@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -61,3 +62,32 @@ def analyze_user_query(message: str) -> AnalyzedQuery:
         search_query=search_query,
     )
 
+
+def parse_llm_analysis(message: str, llm_text: str) -> AnalyzedQuery:
+    fallback = analyze_user_query(message)
+    if not llm_text.strip():
+        return fallback
+
+    try:
+        data = json.loads(llm_text)
+    except json.JSONDecodeError:
+        return fallback
+
+    normalized = str(data.get("normalized") or fallback.normalized).strip()
+    search_query = str(data.get("search_query") or fallback.search_query).strip()
+    raw_keywords = data.get("keywords") or []
+    keywords: list[str] = []
+    if isinstance(raw_keywords, list):
+        for item in raw_keywords:
+            if not isinstance(item, str):
+                continue
+            token = item.strip()
+            if token:
+                keywords.append(token)
+
+    return AnalyzedQuery(
+        original=message,
+        normalized=normalized or fallback.normalized,
+        keywords=keywords or fallback.keywords,
+        search_query=search_query or fallback.search_query,
+    )

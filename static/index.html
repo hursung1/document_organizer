@@ -9,16 +9,19 @@
   <body>
     <div class="app-shell">
       <aside class="sidebar">
-        <div class="brand">Doc Organizer</div>
-        <p class="subtitle">문서를 선택해 새 대화를 시작하세요</p>
-        <div id="starterCards" class="starter-cards"></div>
+        <div class="history-title">대화 내역</div>
+        <div id="historyList" class="history-list"></div>
       </aside>
 
       <main class="chat-panel">
+        <header class="chat-header">
+          <h1 id="chatTitle">새 채팅</h1>
+          <button id="newChatButton" type="button">새 채팅</button>
+        </header>
         <div id="messages" class="messages">
           <div class="empty-state">
-            <h1>문서를 고르면 대화를 시작합니다</h1>
-            <p>초기 카드에서 원하는 문서를 클릭하세요.</p>
+            <h2>질문을 입력하거나 추천 문서를 선택하세요</h2>
+            <div id="starterCards" class="starter-cards"></div>
           </div>
         </div>
 
