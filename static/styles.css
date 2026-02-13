@@ -165,6 +165,8 @@ body {
   max-width: 900px;
   margin: 0 auto 14px;
   display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .bubble {
@@ -185,11 +187,34 @@ body {
 }
 
 .msg.user {
-  justify-content: flex-end;
+  align-items: flex-end;
 }
 
 .msg.assistant {
-  justify-content: flex-start;
+  align-items: flex-start;
+}
+
+.reasoning-toggle {
+  max-width: 78%;
+  border: 1px solid var(--border);
+  background: #f8fafc;
+  border-radius: 10px;
+  padding: 6px 10px;
+}
+
+.reasoning-toggle summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  user-select: none;
+}
+
+.reasoning-content {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 12px;
+  color: #334155;
 }
 
 .followups {
@@ -224,6 +249,37 @@ body {
   display: none;
 }
 
+.bubble.loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #334155;
+  background: #e2e8f0;
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #cbd5e1;
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+.dot-wave span {
+  display: inline-block;
+  animation: dot-wave 1.1s infinite ease-in-out;
+  opacity: 0.35;
+}
+
+.dot-wave span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.dot-wave span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
 .composer {
   border-top: 1px solid var(--border);
   padding: 14px 20px 20px;
@@ -248,6 +304,32 @@ body {
   background: var(--primary);
   color: #fff;
   cursor: pointer;
+}
+
+.composer button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes dot-wave {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  50% {
+    transform: translateY(-2px);
+    opacity: 1;
+  }
 }
 
 @media (max-width: 900px) {

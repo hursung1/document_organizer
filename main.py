@@ -6,15 +6,16 @@ import random
 import re
 import time
 import uuid
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from redis import Redis
+from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from doc_organizer.arxiv_fetcher import ArxivFetcherService
@@ -67,6 +68,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     conversation_id: str
     answer: str
+    reasoning: str | None = None
     suggested_questions: list[str]
 
 
@@ -84,6 +86,7 @@ class ConversationsResponse(BaseModel):
 class ConversationMessage(BaseModel):
     role: str
     text: str
+    reasoning: str | None = None
     created_at: str
 
 
@@ -94,6 +97,41 @@ class ConversationMessagesResponse(BaseModel):
 
 CHAT_KEY_PREFIX = "doc_organizer:chat"
 CHAT_INDEX_KEY = f"{CHAT_KEY_PREFIX}:index"
+STAGE_LABELS = {
+    "analyze_query": "질의 분석 중",
+    "retrieve_docs": "문서 검색 중",
+    "enrich_with_arxiv_pdf": "arXiv 원문 보강 중",
+    "generate_answer": "답변 생성 중",
+}
+SUMMARY_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "using",
+    "based",
+    "study",
+    "paper",
+    "method",
+    "model",
+    "data",
+    "approach",
+    "results",
+    "문서",
+    "내용",
+    "대한",
+    "관련",
+    "통해",
+    "기반",
+    "연구",
+    "방법",
+    "모델",
+    "결과",
+}
 
 
 def _chat_meta_key(conversation_id: str) -> str:
@@ -108,6 +146,11 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _sse_event(event: str, payload: dict[str, Any]) -> str:
+    body = json.dumps(payload, ensure_ascii=False)
+    return f"event: {event}\ndata: {body}\n\n"
+
+
 def _title_from_message(message: str) -> str:
     normalized = _normalize_space(message)
     if not normalized:
@@ -117,24 +160,27 @@ def _title_from_message(message: str) -> str:
     return f"{normalized[:40]}..."
 
 
-def _resolve_redis_client() -> Redis:
+async def _resolve_redis_client() -> Redis:
     global redis_client
     if redis_client is not None:
         return redis_client
     redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
-    redis_client.ping()
+    await redis_client.ping()
     return redis_client
 
 
-def _create_or_touch_conversation(conversation_id: str, first_message: str | None = None) -> None:
-    client = _resolve_redis_client()
+async def _create_or_touch_conversation(
+    conversation_id: str,
+    first_message: str | None = None,
+) -> None:
+    client = await _resolve_redis_client()
     now_iso = _utc_now_iso()
     meta_key = _chat_meta_key(conversation_id)
 
-    existing = client.hgetall(meta_key)
+    existing = await client.hgetall(meta_key)
     if not existing:
         title = _title_from_message(first_message or "")
-        client.hset(
+        await client.hset(
             meta_key,
             mapping={
                 "conversation_id": conversation_id,
@@ -144,30 +190,39 @@ def _create_or_touch_conversation(conversation_id: str, first_message: str | Non
             },
         )
     else:
-        client.hset(meta_key, mapping={"updated_at": now_iso})
+        await client.hset(meta_key, mapping={"updated_at": now_iso})
         if first_message and not existing.get("title"):
-            client.hset(meta_key, mapping={"title": _title_from_message(first_message)})
+            await client.hset(meta_key, mapping={"title": _title_from_message(first_message)})
 
-    client.zadd(CHAT_INDEX_KEY, {conversation_id: time.time()})
+    await client.zadd(CHAT_INDEX_KEY, {conversation_id: time.time()})
 
 
-def _append_message(conversation_id: str, role: str, text: str) -> None:
-    client = _resolve_redis_client()
+async def _append_message(
+    conversation_id: str,
+    role: str,
+    text: str,
+    reasoning: str | None = None,
+) -> None:
+    client = await _resolve_redis_client()
     payload = {
         "role": role,
         "text": text,
+        "reasoning": reasoning,
         "created_at": _utc_now_iso(),
     }
-    client.rpush(_chat_messages_key(conversation_id), json.dumps(payload, ensure_ascii=False))
-    _create_or_touch_conversation(conversation_id, first_message=text if role == "user" else None)
+    await client.rpush(_chat_messages_key(conversation_id), json.dumps(payload, ensure_ascii=False))
+    await _create_or_touch_conversation(
+        conversation_id,
+        first_message=text if role == "user" else None,
+    )
 
 
-def _list_conversations(limit: int = 200) -> list[ConversationSummary]:
-    client = _resolve_redis_client()
-    ids = client.zrevrange(CHAT_INDEX_KEY, 0, max(0, limit - 1))
+async def _list_conversations(limit: int = 200) -> list[ConversationSummary]:
+    client = await _resolve_redis_client()
+    ids = await client.zrevrange(CHAT_INDEX_KEY, 0, max(0, limit - 1))
     out: list[ConversationSummary] = []
     for conversation_id in ids:
-        meta = client.hgetall(_chat_meta_key(conversation_id))
+        meta = await client.hgetall(_chat_meta_key(conversation_id))
         if not meta:
             continue
         out.append(
@@ -181,9 +236,9 @@ def _list_conversations(limit: int = 200) -> list[ConversationSummary]:
     return out
 
 
-def _get_conversation_messages(conversation_id: str) -> list[ConversationMessage]:
-    client = _resolve_redis_client()
-    raw_items = client.lrange(_chat_messages_key(conversation_id), 0, -1)
+async def _get_conversation_messages(conversation_id: str) -> list[ConversationMessage]:
+    client = await _resolve_redis_client()
+    raw_items = await client.lrange(_chat_messages_key(conversation_id), 0, -1)
     messages: list[ConversationMessage] = []
     for raw in raw_items:
         try:
@@ -194,6 +249,11 @@ def _get_conversation_messages(conversation_id: str) -> list[ConversationMessage
             ConversationMessage(
                 role=str(item.get("role", "assistant")),
                 text=str(item.get("text", "")),
+                reasoning=(
+                    str(item.get("reasoning", "")).strip() or None
+                    if item.get("reasoning") is not None
+                    else None
+                ),
                 created_at=str(item.get("created_at", _utc_now_iso())),
             )
         )
@@ -226,6 +286,29 @@ def _first_sentence(text: str, fallback: str) -> str:
     return fallback
 
 
+def _extract_summary_keywords(text: str, limit: int = 3) -> list[str]:
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{1,}|[가-힣]{2,}", text)
+    normalized_tokens = [token.strip() for token in tokens if token.strip()]
+    filtered = [
+        token
+        for token in normalized_tokens
+        if token.lower() not in SUMMARY_STOPWORDS and len(token) >= 2
+    ]
+    if not filtered:
+        return []
+    ranked = Counter(token.lower() for token in filtered).most_common(limit)
+    return [token for token, _ in ranked]
+
+
+def _korean_one_sentence_summary(title: str, body: str) -> str:
+    clean_title = _normalize_space(title) or "이 문서"
+    keywords = _extract_summary_keywords(_normalize_space(f"{title} {body}"))
+    if keywords:
+        keyword_text = ", ".join(keywords)
+        return f"{clean_title} 문서는 {keyword_text}을 중심으로 핵심 내용과 의미를 한 문장으로 요약한다."
+    return f"{clean_title} 문서는 핵심 내용과 의의를 간결하게 정리한 문서다."
+
+
 def _build_doc_title(path: Path) -> str:
     return path.stem.replace("_", " ").strip() or path.name
 
@@ -245,10 +328,7 @@ def _load_documents() -> list[dict[str, str]]:
                 "id": str(path.resolve()),
                 "title": title,
                 "content": cleaned,
-                "summary": _first_sentence(
-                    cleaned,
-                    f"{title} 문서는 주요 내용을 요약할 수 있을 만큼 텍스트가 충분하지 않습니다.",
-                ),
+                "summary": _korean_one_sentence_summary(title=title, body=cleaned),
                 "source_path": str(path),
             }
         )
@@ -316,7 +396,7 @@ def _load_arxiv_starter_docs(count: int = 3) -> list[dict[str, str]]:
                 {
                     "id": doc_id,
                     "title": title,
-                    "summary": summary,
+                    "summary": _korean_one_sentence_summary(title=title, body=summary),
                 }
             )
 
@@ -326,17 +406,6 @@ def _load_arxiv_starter_docs(count: int = 3) -> list[dict[str, str]]:
         random.shuffle(candidates)
         return candidates
     return random.sample(candidates, count)
-
-
-def _suggest_questions(message: str) -> list[str]:
-    topic = re.sub(r"\s+", " ", message).strip()
-    if len(topic) > 30:
-        topic = f"{topic[:30]}..."
-    return [
-        f"방금 답변을 3줄로 요약해줘.",
-        f"'{topic}' 관련해서 실무 체크리스트를 만들어줘.",
-        f"근거가 된 문서 조각을 더 자세히 보여줘.",
-    ]
 
 
 def _resolve_qa_service() -> DocumentQAService:
@@ -454,7 +523,8 @@ async def on_startup() -> None:
         arxiv_milvus_service = ArxivMilvusIngestionService(settings)
     except Exception as exc:
         runtime_state["last_error"] = str(exc)
-    periodic_task = asyncio.create_task(_periodic_ingestion_loop())
+    if settings.auto_ingest_enabled:
+        periodic_task = asyncio.create_task(_periodic_ingestion_loop())
     arxiv_task = asyncio.create_task(_arxiv_scheduler_loop())
 
 
@@ -479,11 +549,11 @@ async def on_shutdown() -> None:
             pass
         arxiv_task = None
     if qa_service is not None:
-        qa_service.close()
+        await qa_service.aclose()
         qa_service = None
     if redis_client is not None:
         try:
-            redis_client.close()
+            await redis_client.aclose()
         except Exception:
             pass
         redis_client = None
@@ -495,6 +565,7 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "running": runtime_state["running"],
         "interval_seconds": settings.interval_seconds,
+        "auto_ingest_enabled": settings.auto_ingest_enabled,
         "last_run_at": runtime_state["last_run_at"],
         "last_summary": runtime_state["last_summary"],
         "last_error": runtime_state["last_error"],
@@ -526,9 +597,10 @@ async def index() -> FileResponse:
 
 @app.get("/api/starter-docs", response_model=StarterDocsResponse)
 async def starter_docs() -> StarterDocsResponse:
-    documents = _load_arxiv_starter_docs(count=3)
+    documents = await asyncio.to_thread(_load_arxiv_starter_docs, 3)
     if not documents:
-        documents = _pick_starter_docs(_load_documents(), count=3)
+        docs = await asyncio.to_thread(_load_documents)
+        documents = _pick_starter_docs(docs, count=3)
     return StarterDocsResponse(
         documents=[
             StarterDoc(id=doc["id"], title=doc["title"], summary=doc["summary"])
@@ -540,7 +612,7 @@ async def starter_docs() -> StarterDocsResponse:
 @app.get("/api/conversations", response_model=ConversationsResponse)
 async def conversations() -> ConversationsResponse:
     try:
-        return ConversationsResponse(conversations=_list_conversations())
+        return ConversationsResponse(conversations=await _list_conversations())
     except RedisError as exc:
         raise HTTPException(status_code=503, detail=f"Redis is not available: {exc}") from exc
 
@@ -550,7 +622,7 @@ async def conversation_messages(conversation_id: str) -> ConversationMessagesRes
     try:
         return ConversationMessagesResponse(
             conversation_id=conversation_id,
-            messages=_get_conversation_messages(conversation_id),
+            messages=await _get_conversation_messages(conversation_id),
         )
     except RedisError as exc:
         raise HTTPException(status_code=503, detail=f"Redis is not available: {exc}") from exc
@@ -564,11 +636,33 @@ async def chat(payload: ChatRequest) -> ChatResponse:
     conversation_id = (payload.conversation_id or "").strip() or uuid.uuid4().hex
 
     try:
-        _append_message(conversation_id, role="user", text=message)
-        rag_result = await asyncio.to_thread(_resolve_qa_service().answer, message)
+        await _append_message(conversation_id, role="user", text=message)
+        history_messages = await _get_conversation_messages(conversation_id)
+        history_payload = [
+            {"role": item.role, "text": item.text}
+            for item in history_messages
+        ]
+        qa = _resolve_qa_service()
+        rag_result = await qa.answer(
+            message,
+            conversation_id,
+            history_payload,
+        )
         runtime_state["last_qa_error"] = None
         answer = rag_result.answer
-        _append_message(conversation_id, role="assistant", text=answer)
+        reasoning = rag_result.reasoning
+        suggested_questions = await qa.suggest_follow_up_questions(
+            message=message,
+            retrieved=rag_result.retrieved,
+            answer=answer,
+            limit=2,
+        )
+        await _append_message(
+            conversation_id,
+            role="assistant",
+            text=answer,
+            reasoning=reasoning,
+        )
     except Exception as exc:
         runtime_state["last_qa_error"] = str(exc)
         raise HTTPException(status_code=500, detail=f"Failed to answer with RAG: {exc}") from exc
@@ -576,7 +670,81 @@ async def chat(payload: ChatRequest) -> ChatResponse:
     return ChatResponse(
         conversation_id=conversation_id,
         answer=answer,
-        suggested_questions=_suggest_questions(message),
+        reasoning=reasoning,
+        suggested_questions=suggested_questions,
+    )
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(payload: ChatRequest) -> StreamingResponse:
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is empty.")
+    conversation_id = (payload.conversation_id or "").strip() or uuid.uuid4().hex
+
+    async def event_generator():
+        try:
+            qa = _resolve_qa_service()
+            await _append_message(conversation_id, role="user", text=message)
+            history_messages = await _get_conversation_messages(conversation_id)
+            history_payload = [{"role": item.role, "text": item.text} for item in history_messages]
+
+            final_answer: str | None = None
+            final_reasoning: str | None = None
+            final_suggested_questions: list[str] = []
+            async for progress in qa.answer_with_progress(
+                message=message,
+                conversation_id=conversation_id,
+                chat_history=history_payload,
+            ):
+                if progress.kind == "stage":
+                    stage = (progress.stage or "").strip()
+                    label = STAGE_LABELS.get(stage, "답변 생성 중")
+                    yield _sse_event("stage", {"stage": stage, "label": label})
+                    continue
+
+                if progress.kind == "final" and progress.response is not None:
+                    final_answer = progress.response.answer
+                    final_reasoning = progress.response.reasoning
+                    final_suggested_questions = await qa.suggest_follow_up_questions(
+                        message=message,
+                        retrieved=progress.response.retrieved,
+                        answer=final_answer,
+                        limit=2,
+                    )
+                    await _append_message(
+                        conversation_id,
+                        role="assistant",
+                        text=final_answer,
+                        reasoning=final_reasoning,
+                    )
+                    runtime_state["last_qa_error"] = None
+                    yield _sse_event(
+                        "final",
+                        {
+                            "conversation_id": conversation_id,
+                            "answer": final_answer,
+                            "reasoning": final_reasoning,
+                            "suggested_questions": final_suggested_questions,
+                        },
+                    )
+                    break
+
+            if final_answer is None:
+                raise RuntimeError("No final response from QA pipeline.")
+
+            yield _sse_event("done", {"ok": True})
+        except Exception as exc:
+            runtime_state["last_qa_error"] = str(exc)
+            yield _sse_event("error", {"detail": f"Failed to answer with RAG: {exc}"})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

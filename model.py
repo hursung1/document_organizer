@@ -13,7 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--config-path", default="config.yaml")
     parser.add_argument("--collection", default="doc_chunks")
-    parser.add_argument("--milvus-uri", default="http://localhost:19530")
+    parser.add_argument("--milvus-uri", default="tcp://localhost:19530")
     parser.add_argument("--milvus-user", default=None)
     parser.add_argument("--milvus-password", default=None)
     parser.add_argument("--ollama-host", default="http://localhost:11434")

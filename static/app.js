@@ -6,6 +6,7 @@ const chatFormEl = document.getElementById("chatForm");
 const userInputEl = document.getElementById("userInput");
 const followUpSectionEl = document.getElementById("followUpSection");
 const followUpChipsEl = document.getElementById("followUpChips");
+const sendButtonEl = chatFormEl.querySelector('button[type="submit"]');
 
 let starterDocs = [];
 let conversations = [];
@@ -13,6 +14,11 @@ let activeConversationId = null;
 let activeMessages = [];
 let activeFollowUps = [];
 let showStarters = true;
+const STAGE_LABELS = {
+  analyze_query: "질의 분석 중",
+  retrieve_docs: "문서 검색 중",
+  generate_answer: "답변 생성 중",
+};
 
 function formatTimeFromIso(isoText) {
   if (!isoText) {
@@ -35,9 +41,25 @@ function currentConversationTitle() {
   return active?.title || "대화";
 }
 
-function appendMessageNode(role, text) {
+function appendMessageNode(role, text, reasoning = null) {
   const wrapper = document.createElement("div");
   wrapper.className = `msg ${role}`;
+
+  if (role === "assistant" && reasoning && String(reasoning).trim()) {
+    const reasoningToggle = document.createElement("details");
+    reasoningToggle.className = "reasoning-toggle";
+
+    const summary = document.createElement("summary");
+    summary.textContent = "Thinking 보기";
+
+    const content = document.createElement("pre");
+    content.className = "reasoning-content";
+    content.textContent = String(reasoning).trim();
+
+    reasoningToggle.appendChild(summary);
+    reasoningToggle.appendChild(content);
+    wrapper.appendChild(reasoningToggle);
+  }
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
@@ -49,8 +71,54 @@ function appendMessageNode(role, text) {
   return wrapper;
 }
 
-function appendLoadingMessage(text = "답변 생성 중...") {
-  return appendMessageNode("assistant", text);
+function appendProgressBubble(initialStage = "질의 분석 중") {
+  const wrapper = document.createElement("div");
+  wrapper.className = "msg assistant";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble loading";
+  bubble.innerHTML = `
+    <span class="spinner" aria-hidden="true"></span>
+    <span class="progress-label">${initialStage}</span>
+    <span class="dot-wave" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+  `;
+
+  wrapper.appendChild(bubble);
+  messagesEl.appendChild(wrapper);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  return {
+    wrapper,
+    bubble,
+    label: bubble.querySelector(".progress-label"),
+  };
+}
+
+function setProgressStage(progressBubble, stageText) {
+  if (!progressBubble?.label) {
+    return;
+  }
+  progressBubble.label.textContent = stageText;
+}
+
+function finalizeProgressBubble(progressBubble, finalText) {
+  if (!progressBubble?.bubble) {
+    return;
+  }
+  progressBubble.bubble.classList.remove("loading");
+  progressBubble.bubble.textContent = finalText;
+}
+
+function setGeneratingState(isGenerating) {
+  if (isGenerating) {
+    userInputEl.setAttribute("aria-busy", "true");
+    sendButtonEl.disabled = true;
+    sendButtonEl.textContent = "생성 중";
+    return;
+  }
+  userInputEl.setAttribute("aria-busy", "false");
+  sendButtonEl.disabled = false;
+  sendButtonEl.textContent = "전송";
 }
 
 function renderFollowUps(questions) {
@@ -125,7 +193,7 @@ function renderMessages() {
   }
 
   activeMessages.forEach((message) => {
-    appendMessageNode(message.role, message.text);
+    appendMessageNode(message.role, message.text, message.reasoning || null);
   });
   renderFollowUps(activeFollowUps);
 }
@@ -193,10 +261,11 @@ async function sendChat(messageText) {
   renderMessages();
 
   userInputEl.value = "";
-  const loadingNode = appendLoadingMessage();
+  const progressBubble = appendProgressBubble("질의 분석 중");
+  setGeneratingState(true);
 
   try {
-    const response = await fetch("/api/chat", {
+    const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -217,28 +286,109 @@ async function sendChat(messageText) {
       throw new Error(detail);
     }
 
-    const payload = await response.json();
-    loadingNode.remove();
-    activeConversationId = payload.conversation_id;
+    let finalPayload = null;
+    let streamError = null;
+    await consumeSse(response, (eventName, data) => {
+      if (eventName === "stage") {
+        const stage = (data?.stage || "").trim();
+        const label = data?.label || STAGE_LABELS[stage] || "답변 생성 중";
+        setProgressStage(progressBubble, label);
+        return;
+      }
+      if (eventName === "final") {
+        finalPayload = data;
+        return;
+      }
+      if (eventName === "error") {
+        streamError = data?.detail || "스트리밍 중 오류가 발생했습니다.";
+      }
+    });
+
+    if (streamError) {
+      throw new Error(streamError);
+    }
+    if (!finalPayload) {
+      throw new Error("최종 답변 이벤트를 받지 못했습니다.");
+    }
+
+    activeConversationId = finalPayload.conversation_id;
+    const finalAnswer = finalPayload.answer || "답변이 없습니다.";
+    finalizeProgressBubble(progressBubble, finalAnswer);
     activeMessages.push({
       role: "assistant",
-      text: payload.answer || "답변이 없습니다.",
+      text: finalAnswer,
+      reasoning: finalPayload.reasoning || null,
       created_at: new Date().toISOString(),
     });
-    activeFollowUps = payload.suggested_questions || [];
+    activeFollowUps = finalPayload.suggested_questions || [];
 
     await refreshConversations();
     renderMessages();
   } catch (error) {
-    loadingNode.remove();
     const errorText = error instanceof Error ? error.message : String(error);
+    const finalError = `답변 생성 중 오류가 발생했습니다: ${errorText}`;
+    finalizeProgressBubble(progressBubble, finalError);
     activeMessages.push({
       role: "assistant",
-      text: `답변 생성 중 오류가 발생했습니다: ${errorText}`,
+      text: finalError,
+      reasoning: null,
       created_at: new Date().toISOString(),
     });
     activeFollowUps = [];
     renderMessages();
+  } finally {
+    setGeneratingState(false);
+  }
+}
+
+async function consumeSse(response, onEvent) {
+  if (!response.body) {
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary !== -1) {
+      const chunk = buffer.slice(0, boundary).trim();
+      buffer = buffer.slice(boundary + 2);
+
+      if (chunk) {
+        let eventName = "message";
+        const dataLines = [];
+        chunk.split("\n").forEach((line) => {
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+            return;
+          }
+          if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        });
+
+        let payload = {};
+        const dataText = dataLines.join("\n");
+        if (dataText) {
+          try {
+            payload = JSON.parse(dataText);
+          } catch (error) {
+            payload = {};
+          }
+        }
+        onEvent(eventName, payload);
+      }
+
+      boundary = buffer.indexOf("\n\n");
+    }
   }
 }
 
@@ -275,6 +425,7 @@ async function init() {
   await loadStarterDocs();
   await refreshConversations();
   createConversation();
+  setGeneratingState(false);
 }
 
 init();

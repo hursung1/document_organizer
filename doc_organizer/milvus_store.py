@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from pymilvus import (
     AnnSearchRequest,
@@ -38,11 +39,28 @@ class MilvusStore:
         self._collection: Collection | None = None
 
     def connect(self) -> None:
+        parsed = urlparse(self._uri)
+        if parsed.hostname and parsed.port:
+            try:
+                connections.connect(
+                    alias="default",
+                    host=parsed.hostname,
+                    port=str(parsed.port),
+                    user=self._user,
+                    password=self._password,
+                    timeout=5,
+                )
+                return
+            except Exception:
+                # Fall through to URI mode for deployments that require URI transport.
+                pass
+
         connections.connect(
             alias="default",
             uri=self._uri,
             user=self._user,
             password=self._password,
+            timeout=5,
         )
 
     def ensure_collection(self, dim: int) -> Collection:

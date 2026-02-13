@@ -27,7 +27,8 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 - `POST /ingest/run`: 수동 1회 적재
 - `POST /arxiv/run`: ArXiv 논문 수동 업데이트
 - `GET /health`: 상태 확인
-- 서비스 시작 후 주기적으로 적재 실행 (`INGEST_INTERVAL_SECONDS`, 기본 21600초=6시간)
+- OCR 자동 적재는 기본 비활성 (`AUTO_INGEST_ENABLED=false`)
+- 활성화 시 주기적으로 적재 실행 (`INGEST_INTERVAL_SECONDS`, 기본 21600초=6시간)
 - ArXiv 논문은 매일 오전 9시에 자동 업데이트
 - 서버가 오전 9시(KST) 이후에 실행되었고 전날(KST) 업데이트 내역이 없으면 즉시 1회 업데이트
 
@@ -64,12 +65,15 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 
 ### 선택 환경변수
 
-- `MILVUS_URI` (기본: `http://localhost:19530`)
+- `MILVUS_URI` (기본: `tcp://localhost:19530`)
 - `MILVUS_USER`
 - `MILVUS_PASSWORD`
 - `OLLAMA_HOST` (기본: `http://localhost:11434`)
+- `LLM_PROVIDER` (기본: `gemini`, 선택: `gemini` / `ollama`)
 - `EMBED_MODEL` (기본: `embeddinggemma:latest`)
 - `QA_MODEL` (기본: `qwen3:latest`)
+- `GEMINI_MODEL` (기본: `gemini-2.0-flash`)
+- `GEMINI_API_KEY` (Gemini 사용 시 필수)
 - `RETRIEVAL_TOP_K` (기본: `5`)
 - `DENSE_WEIGHT` (기본: `0.7`)
 - `SPARSE_WEIGHT` (기본: `0.3`)
@@ -79,3 +83,4 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 - `ARXIV_SCHEDULE_HOUR` (기본: `9`)
 - `ARXIV_MAX_RESULTS_PER_TOPIC` (기본: `50`)
 - `ARXIV_TOPICS` (쉼표 구분, 기본: `computer science,artificial intelligence,large language model,LLM`)
+- `AUTO_INGEST_ENABLED` (기본: `false`)
