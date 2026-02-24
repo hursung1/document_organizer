@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Doc Organizer Chat</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260224a" />
   </head>
   <body>
     <div class="app-shell">
@@ -37,6 +37,16 @@
       </main>
     </div>
 
-    <script src="/static/app.js" defer></script>
+    <div id="deleteConfirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <p class="modal-text">이 대화 내역을 삭제하시겠어요?</p>
+        <div class="modal-actions">
+          <button id="confirmDeleteYes" type="button">예</button>
+          <button id="confirmDeleteNo" type="button">아니오</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/app.js?v=20260224a" defer></script>
   </body>
 </html>

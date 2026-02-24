@@ -55,13 +55,30 @@ body {
   padding: 10px;
   color: var(--text);
   width: 100%;
-  display: block;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
   overflow: hidden;
 }
 
 .history-item.active {
   border-color: #0f766e;
   background: #ecfdf5;
+}
+
+.history-main {
+  min-width: 0;
+}
+
+.history-delete {
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  background: #fff1f2;
+  color: #b91c1c;
+  padding: 4px 9px;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .history-item .label {
@@ -347,4 +364,67 @@ body {
     height: auto;
     min-height: 62vh;
   }
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+}
+
+.modal-backdrop.hidden {
+  display: none;
+}
+
+.modal-card {
+  width: min(360px, calc(100vw - 40px));
+  background: #fff;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.18);
+  padding: 18px 16px;
+}
+
+.modal-text {
+  margin: 0 0 16px;
+  color: #1e293b;
+  font-size: 14px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: space-between;
+}
+
+.modal-actions button {
+  width: 120px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #fff;
+  padding: 8px 0;
+  cursor: pointer;
+}
+
+#confirmDeleteYes {
+  border-color: #fecaca;
+  background: #ef4444;
+  color: #fff;
+}
+
+#confirmDeleteYes:hover {
+  background: #dc2626;
+}
+
+#confirmDeleteNo {
+  border-color: #bbf7d0;
+  background: #22c55e;
+  color: #fff;
+}
+
+#confirmDeleteNo:hover {
+  background: #16a34a;
 }

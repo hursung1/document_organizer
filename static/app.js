@@ -7,6 +7,9 @@ const userInputEl = document.getElementById("userInput");
 const followUpSectionEl = document.getElementById("followUpSection");
 const followUpChipsEl = document.getElementById("followUpChips");
 const sendButtonEl = chatFormEl.querySelector('button[type="submit"]');
+const deleteConfirmModalEl = document.getElementById("deleteConfirmModal");
+const confirmDeleteYesEl = document.getElementById("confirmDeleteYes");
+const confirmDeleteNoEl = document.getElementById("confirmDeleteNo");
 
 let starterDocs = [];
 let conversations = [];
@@ -14,6 +17,7 @@ let activeConversationId = null;
 let activeMessages = [];
 let activeFollowUps = [];
 let showStarters = true;
+let pendingDeleteConversationId = null;
 const STAGE_LABELS = {
   analyze_query: "질의 분석 중",
   retrieve_docs: "문서 검색 중",
@@ -149,18 +153,86 @@ function renderHistoryList() {
   );
 
   sorted.forEach((conversation) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `history-item ${
+    const item = document.createElement("div");
+    item.className = `history-item ${
       conversation.conversation_id === activeConversationId ? "active" : ""
     }`;
-    button.innerHTML = `
-      <div class="label">${conversation.title || "새 대화"}</div>
-      <div class="meta">${formatTimeFromIso(conversation.updated_at)}</div>
+    item.setAttribute("role", "button");
+    item.setAttribute("tabindex", "0");
+    item.innerHTML = `
+      <div class="history-main">
+        <div class="label">${conversation.title || "새 대화"}</div>
+        <div class="meta">${formatTimeFromIso(conversation.updated_at)}</div>
+      </div>
+      <button type="button" class="history-delete">삭제</button>
     `;
-    button.addEventListener("click", () => openConversation(conversation.conversation_id));
-    historyListEl.appendChild(button);
+    const deleteButton = item.querySelector(".history-delete");
+    deleteButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openDeleteModal(conversation.conversation_id);
+    });
+
+    item.addEventListener("click", (event) => {
+      if (event.target.closest(".history-delete")) {
+        return;
+      }
+      openConversation(conversation.conversation_id);
+    });
+    item.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openConversation(conversation.conversation_id);
+      }
+    });
+
+    historyListEl.appendChild(item);
   });
+}
+
+function openDeleteModal(conversationId) {
+  pendingDeleteConversationId = conversationId;
+  deleteConfirmModalEl.classList.remove("hidden");
+}
+
+function closeDeleteModal() {
+  pendingDeleteConversationId = null;
+  deleteConfirmModalEl.classList.add("hidden");
+}
+
+async function confirmDeleteConversation() {
+  const conversationId = pendingDeleteConversationId;
+  if (!conversationId) {
+    closeDeleteModal();
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/conversations/${conversationId}`, {
+      method: "DELETE",
+    });
+    if (!response.ok && response.status !== 404) {
+      let detail = "삭제 실패";
+      try {
+        const payload = await response.json();
+        if (payload?.detail) {
+          detail = payload.detail;
+        }
+      } catch (error) {
+        // Keep fallback message.
+      }
+      throw new Error(detail);
+    }
+
+    await refreshConversations();
+    if (activeConversationId === conversationId) {
+      createConversation();
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    window.alert(`대화 삭제 중 오류가 발생했습니다: ${message}`);
+  } finally {
+    closeDeleteModal();
+  }
 }
 
 function renderStarterButtons(container) {
@@ -419,6 +491,14 @@ userInputEl.addEventListener("keydown", (event) => {
 
 newChatButtonEl.addEventListener("click", () => {
   createConversation();
+});
+
+confirmDeleteYesEl.addEventListener("click", () => {
+  confirmDeleteConversation();
+});
+
+confirmDeleteNoEl.addEventListener("click", () => {
+  closeDeleteModal();
 });
 
 async function init() {

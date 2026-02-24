@@ -260,6 +260,16 @@ async def _get_conversation_messages(conversation_id: str) -> list[ConversationM
     return messages
 
 
+async def _delete_conversation(conversation_id: str) -> bool:
+    client = await _resolve_redis_client()
+    removed_index = await client.zrem(CHAT_INDEX_KEY, conversation_id)
+    deleted_keys = await client.delete(
+        _chat_meta_key(conversation_id),
+        _chat_messages_key(conversation_id),
+    )
+    return bool(removed_index or deleted_keys)
+
+
 def _normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -624,6 +634,17 @@ async def conversation_messages(conversation_id: str) -> ConversationMessagesRes
             conversation_id=conversation_id,
             messages=await _get_conversation_messages(conversation_id),
         )
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail=f"Redis is not available: {exc}") from exc
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str) -> dict[str, Any]:
+    try:
+        deleted = await _delete_conversation(conversation_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return {"deleted": True, "conversation_id": conversation_id}
     except RedisError as exc:
         raise HTTPException(status_code=503, detail=f"Redis is not available: {exc}") from exc
 
