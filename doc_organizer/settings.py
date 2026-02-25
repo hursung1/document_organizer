@@ -25,6 +25,7 @@ class IngestionSettings:
     sparse_weight: float = 0.3
     llm_provider: str = "gemini"
     qa_model: str = "qwen3:latest"
+    ollama_reasoning: bool | str | None = None
     gemini_model: str = "gemini-2.0-flash"
     gemini_api_key: str | None = None
     redis_url: str = "redis://localhost:6379/0"
@@ -49,6 +50,11 @@ class IngestionSettings:
 
     @classmethod
     def from_env(cls) -> IngestionSettings:
+        qa_model = os.getenv("QA_MODEL", "qwen3:latest")
+        ollama_reasoning = cls._parse_ollama_reasoning(
+            os.getenv("OLLAMA_REASONING"),
+            qa_model=qa_model,
+        )
         return cls(
             docs_dir=Path(os.getenv("DOCS_DIR", "src_docs")),
             results_dir=Path(os.getenv("RESULTS_DIR", "results")),
@@ -68,7 +74,8 @@ class IngestionSettings:
             dense_weight=float(os.getenv("DENSE_WEIGHT", "0.7")),
             sparse_weight=float(os.getenv("SPARSE_WEIGHT", "0.3")),
             llm_provider=os.getenv("LLM_PROVIDER", "gemini"),
-            qa_model=os.getenv("QA_MODEL", "qwen3:latest"),
+            qa_model=qa_model,
+            ollama_reasoning=ollama_reasoning,
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
@@ -108,3 +115,24 @@ class IngestionSettings:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.arxiv_storage_dir.mkdir(parents=True, exist_ok=True)
         self.arxiv_pdf_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _parse_ollama_reasoning(
+        raw_value: str | None,
+        *,
+        qa_model: str,
+    ) -> bool | str | None:
+        if raw_value is None:
+            model = (qa_model or "").strip().lower()
+            if model.startswith("gpt-oss"):
+                return "high"
+            return None
+
+        normalized = raw_value.strip().lower()
+        if normalized in {"", "none", "null", "auto", "default"}:
+            return None
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return raw_value.strip()

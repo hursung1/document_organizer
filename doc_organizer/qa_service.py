@@ -119,6 +119,7 @@ class DocumentQAService:
                 model=self.settings.qa_model,
                 base_url=self.settings.ollama_host,
                 temperature=0,
+                reasoning=self.settings.ollama_reasoning,
             )
         if provider == "gemini":
             if not self.settings.gemini_api_key:
@@ -333,6 +334,102 @@ class DocumentQAService:
         return candidates[: max(1, limit)]
 
     @staticmethod
+    def _to_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value).strip()
+        if isinstance(value, list):
+            parts = [DocumentQAService._to_text(item) for item in value]
+            return "\n".join([part for part in parts if part]).strip()
+        if isinstance(value, dict):
+            preferred_keys = (
+                "text",
+                "content",
+                "reasoning_content",
+                "thinking",
+                "reasoning",
+                "summary",
+                "output_text",
+            )
+            parts: list[str] = []
+            for key in preferred_keys:
+                if key in value:
+                    text = DocumentQAService._to_text(value.get(key))
+                    if text:
+                        parts.append(text)
+            if parts:
+                return "\n".join(parts).strip()
+            nested_parts = [DocumentQAService._to_text(item) for item in value.values()]
+            return "\n".join([part for part in nested_parts if part]).strip()
+        return str(value).strip()
+
+    @staticmethod
+    def _extract_content_list_parts(content: list[Any]) -> tuple[str, str | None]:
+        answer_parts: list[str] = []
+        reasoning_parts: list[str] = []
+
+        reasoning_types = {
+            "reasoning",
+            "thinking",
+            "reasoning_content",
+            "thought",
+            "think",
+            "analysis",
+        }
+        answer_types = {
+            "text",
+            "output_text",
+            "final",
+            "answer",
+            "message",
+        }
+
+        for item in content:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    answer_parts.append(text)
+                continue
+            if not isinstance(item, dict):
+                text = DocumentQAService._to_text(item)
+                if text:
+                    answer_parts.append(text)
+                continue
+
+            item_type = str(item.get("type", "")).strip().lower()
+            if item_type in reasoning_types:
+                text = DocumentQAService._to_text(item)
+                if text:
+                    reasoning_parts.append(text)
+                continue
+            if item_type in answer_types:
+                text = DocumentQAService._to_text(item.get("text") or item.get("content") or item)
+                if text:
+                    answer_parts.append(text)
+                continue
+
+            text = DocumentQAService._to_text(item.get("text") or item.get("content"))
+            if text:
+                answer_parts.append(text)
+
+            extra_reasoning = DocumentQAService._to_text(
+                item.get("reasoning")
+                or item.get("reasoning_content")
+                or item.get("thinking")
+                or item.get("thought")
+                or item.get("think")
+            )
+            if extra_reasoning:
+                reasoning_parts.append(extra_reasoning)
+
+        answer = "\n".join([part for part in answer_parts if part]).strip()
+        reasoning = "\n".join([part for part in reasoning_parts if part]).strip() or None
+        return answer, reasoning
+
+    @staticmethod
     def _extract_answer_and_reasoning(response: Any) -> tuple[str, str | None]:
         content = getattr(response, "content", "")
         additional_kwargs = getattr(response, "additional_kwargs", {}) or {}
@@ -341,22 +438,22 @@ class DocumentQAService:
         reasoning: str | None = None
         for key in ("reasoning_content", "thinking", "reasoning", "thought", "think"):
             value = additional_kwargs.get(key) or response_metadata.get(key)
-            if isinstance(value, str) and value.strip():
-                reasoning = value.strip()
+            text = DocumentQAService._to_text(value)
+            if text:
+                reasoning = text
                 break
+
+        if reasoning is None:
+            direct_reasoning = DocumentQAService._to_text(getattr(response, "reasoning_content", None))
+            if direct_reasoning:
+                reasoning = direct_reasoning
 
         if isinstance(content, str):
             answer = content.strip()
         elif isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        parts.append(text.strip())
-                elif isinstance(item, str) and item.strip():
-                    parts.append(item.strip())
-            answer = "\n".join(parts).strip()
+            answer, content_reasoning = DocumentQAService._extract_content_list_parts(content)
+            if content_reasoning and not reasoning:
+                reasoning = content_reasoning
         else:
             answer = str(content).strip()
 
@@ -854,7 +951,7 @@ class DocumentQAService:
                 source_url = (item.pdf_url or "").strip() or self._build_pdf_url(arxiv_id)
             else:
                 source_label = source
-                source_url = None
+                source_url = (item.source_url or "").strip() or None
             context_sources[context_idx] = (source_label, source_url)
             context_lines.append(
                 f"[{context_idx}] source={source}, chunk={item.chunk_id}, score={item.score:.4f}\n{snippet[:1000]}"
@@ -905,6 +1002,11 @@ class DocumentQAService:
                 context_sources=context_sources,
                 max_items=3,
             )
+            if not cited_source_lines:
+                cited_source_lines = self._fallback_source_lines(
+                    context_sources=context_sources,
+                    max_items=3,
+                )
             answer_with_sources = self._append_source_lines(answer, cited_source_lines)
             result: RAGState = {"answer": answer_with_sources}
             if reasoning:
@@ -928,6 +1030,11 @@ class DocumentQAService:
                 context_sources=context_sources,
                 max_items=3,
             )
+            if not cited_source_lines:
+                cited_source_lines = self._fallback_source_lines(
+                    context_sources=context_sources,
+                    max_items=3,
+                )
             return {"answer": self._append_source_lines(answer, cited_source_lines)}
 
     async def _node_generate_answer_llm(self, state: RAGState) -> RAGState:
@@ -954,12 +1061,12 @@ class DocumentQAService:
             answer, reasoning = self._extract_answer_and_reasoning(response)
             if not answer:
                 raise RuntimeError("Empty response from LLM.")
-            result: RAGState = {"answer": answer}
+            result: RAGState = {"answer": self._append_source_lines(answer, [])}
             if reasoning:
                 result["reasoning"] = reasoning
             return result
         except Exception as exc:
-            return {"answer": f"LLM 응답 생성 오류: {exc}\n"}
+            return {"answer": self._append_source_lines(f"LLM 응답 생성 오류: {exc}", [])}
 
     def _conditional_edge_doc_base_or_not(self, state: RAGState) -> str:
         retrieved = state.get("retrieved", [])
@@ -1022,11 +1129,45 @@ class DocumentQAService:
         return lines
 
     @staticmethod
+    def _fallback_source_lines(
+        context_sources: dict[int, tuple[str, str | None]],
+        max_items: int = 3,
+    ) -> list[str]:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for idx in sorted(context_sources.keys()):
+            label, url = context_sources[idx]
+            if url:
+                line = f"- [{label}]({url})"
+            else:
+                line = f"- {label}"
+            dedup_key = line.lower()
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            lines.append(line)
+            if len(lines) >= max_items:
+                break
+        return lines
+
+    @staticmethod
+    def _strip_existing_sources_section(answer: str) -> str:
+        text = (answer or "").rstrip()
+        return re.sub(
+            r"\n+Sources:\n(?:- .*(?:\n|$))*\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).rstrip()
+
+    @staticmethod
     def _append_source_lines(answer: str, source_lines: list[str]) -> str:
-        if not source_lines:
-            return answer
-        lines = [answer.rstrip(), "", "Sources:"]
-        lines.extend(source_lines)
+        base_answer = DocumentQAService._strip_existing_sources_section(answer)
+        lines = [base_answer, "", "Sources:"]
+        if source_lines:
+            lines.extend(source_lines)
+        else:
+            lines.append("- (사용된 문서 출처를 식별하지 못했습니다.)")
         return "\n".join(lines)
 
     @staticmethod

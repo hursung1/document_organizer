@@ -587,6 +587,9 @@ async def health() -> dict[str, Any]:
         "arxiv_last_milvus_summary": runtime_state["arxiv_last_milvus_summary"],
         "arxiv_schedule_hour": settings.arxiv_schedule_hour,
         "arxiv_collection": settings.arxiv_collection_name,
+        "llm_provider": settings.llm_provider,
+        "qa_model": settings.qa_model,
+        "ollama_reasoning": settings.ollama_reasoning,
     }
 
 

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Doc Organizer Chat</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260224a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260225c" />
   </head>
   <body>
     <div class="app-shell">
@@ -35,6 +35,21 @@
           <button type="submit">전송</button>
         </form>
       </main>
+
+      <aside id="previewPanel" class="preview-panel" aria-label="문서 미리보기">
+        <div class="preview-header">
+          <div id="previewTitle" class="preview-title">문서 미리보기</div>
+          <button id="previewCloseButton" type="button" class="preview-close">닫기</button>
+        </div>
+        <div id="previewUrl" class="preview-url"></div>
+        <div class="preview-body">
+          <iframe id="previewFrame" title="문서 미리보기"></iframe>
+          <div class="preview-note">
+            미리보기가 보이지 않으면 일부 사이트의 보안 정책 때문입니다.
+            <a id="previewOpenNewTab" href="#" target="_blank" rel="noopener noreferrer">새 탭으로 열기</a>
+          </div>
+        </div>
+      </aside>
     </div>
 
     <div id="deleteConfirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
@@ -47,6 +62,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=20260224a" defer></script>
+    <script src="/static/app.js?v=20260225c" defer></script>
   </body>
 </html>

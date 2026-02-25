@@ -1,4 +1,5 @@
 const historyListEl = document.getElementById("historyList");
+const appShellEl = document.querySelector(".app-shell");
 const chatTitleEl = document.getElementById("chatTitle");
 const newChatButtonEl = document.getElementById("newChatButton");
 const messagesEl = document.getElementById("messages");
@@ -10,6 +11,12 @@ const sendButtonEl = chatFormEl.querySelector('button[type="submit"]');
 const deleteConfirmModalEl = document.getElementById("deleteConfirmModal");
 const confirmDeleteYesEl = document.getElementById("confirmDeleteYes");
 const confirmDeleteNoEl = document.getElementById("confirmDeleteNo");
+const previewPanelEl = document.getElementById("previewPanel");
+const previewTitleEl = document.getElementById("previewTitle");
+const previewUrlEl = document.getElementById("previewUrl");
+const previewFrameEl = document.getElementById("previewFrame");
+const previewCloseButtonEl = document.getElementById("previewCloseButton");
+const previewOpenNewTabEl = document.getElementById("previewOpenNewTab");
 
 let starterDocs = [];
 let conversations = [];
@@ -21,6 +28,7 @@ let pendingDeleteConversationId = null;
 const STAGE_LABELS = {
   analyze_query: "질의 분석 중",
   retrieve_docs: "문서 검색 중",
+  enrich_with_arxiv_pdf: "arXiv 원문 보강 중",
   generate_answer: "답변 생성 중",
 };
 
@@ -32,9 +40,12 @@ function formatTimeFromIso(isoText) {
   if (Number.isNaN(date.getTime())) {
     return "";
   }
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
   const hour = String(date.getHours()).padStart(2, "0");
   const min = String(date.getMinutes()).padStart(2, "0");
-  return `${hour}:${min}`;
+  return `${year}년 ${month}월 ${day}일 ${hour}:${min}`;
 }
 
 function currentConversationTitle() {
@@ -45,29 +56,123 @@ function currentConversationTitle() {
   return active?.title || "대화";
 }
 
+function normalizePreviewUrl(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString();
+  } catch (error) {
+    return null;
+  }
+}
+
+function openPreviewPanel(url, label = "") {
+  const normalized = normalizePreviewUrl(url);
+  if (!normalized || !previewPanelEl || !appShellEl) {
+    return;
+  }
+  const title = String(label || "문서 미리보기").trim() || "문서 미리보기";
+  previewTitleEl.textContent = title;
+  previewUrlEl.textContent = normalized;
+  previewFrameEl.src = normalized;
+  previewOpenNewTabEl.href = normalized;
+  appShellEl.classList.add("preview-open");
+}
+
+function closePreviewPanel() {
+  if (!appShellEl || !previewFrameEl) {
+    return;
+  }
+  appShellEl.classList.remove("preview-open");
+  previewFrameEl.src = "about:blank";
+  previewOpenNewTabEl.href = "#";
+  previewTitleEl.textContent = "문서 미리보기";
+  previewUrlEl.textContent = "";
+}
+
+function appendRichText(container, text) {
+  container.innerHTML = "";
+  const raw = String(text || "");
+  const tokenPattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s]+)/g;
+  let cursor = 0;
+  let match = tokenPattern.exec(raw);
+
+  while (match) {
+    const matchIndex = match.index;
+    if (matchIndex > cursor) {
+      container.appendChild(document.createTextNode(raw.slice(cursor, matchIndex)));
+    }
+
+    const markdownLabel = match[1];
+    const markdownUrl = match[2];
+    const plainUrl = match[3];
+    const candidateUrl = markdownUrl || plainUrl || "";
+    const normalizedUrl = normalizePreviewUrl(candidateUrl);
+
+    if (normalizedUrl) {
+      const anchor = document.createElement("a");
+      anchor.className = "doc-link";
+      anchor.href = normalizedUrl;
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      anchor.textContent = markdownLabel || normalizedUrl;
+      anchor.addEventListener("click", (event) => {
+        event.preventDefault();
+        openPreviewPanel(normalizedUrl, markdownLabel || normalizedUrl);
+      });
+      container.appendChild(anchor);
+    } else {
+      container.appendChild(document.createTextNode(match[0]));
+    }
+
+    cursor = tokenPattern.lastIndex;
+    match = tokenPattern.exec(raw);
+  }
+
+  if (cursor < raw.length) {
+    container.appendChild(document.createTextNode(raw.slice(cursor)));
+  }
+}
+
+function createReasoningToggle(reasoning) {
+  if (!reasoning || !String(reasoning).trim()) {
+    return null;
+  }
+  const reasoningToggle = document.createElement("details");
+  reasoningToggle.className = "reasoning-toggle";
+
+  const summary = document.createElement("summary");
+  summary.textContent = "Thinking 보기";
+
+  const content = document.createElement("pre");
+  content.className = "reasoning-content";
+  content.textContent = String(reasoning).trim();
+
+  reasoningToggle.appendChild(summary);
+  reasoningToggle.appendChild(content);
+  return reasoningToggle;
+}
+
 function appendMessageNode(role, text, reasoning = null) {
   const wrapper = document.createElement("div");
   wrapper.className = `msg ${role}`;
 
-  if (role === "assistant" && reasoning && String(reasoning).trim()) {
-    const reasoningToggle = document.createElement("details");
-    reasoningToggle.className = "reasoning-toggle";
-
-    const summary = document.createElement("summary");
-    summary.textContent = "Thinking 보기";
-
-    const content = document.createElement("pre");
-    content.className = "reasoning-content";
-    content.textContent = String(reasoning).trim();
-
-    reasoningToggle.appendChild(summary);
-    reasoningToggle.appendChild(content);
-    wrapper.appendChild(reasoningToggle);
+  if (role === "assistant") {
+    const reasoningToggle = createReasoningToggle(reasoning);
+    if (reasoningToggle) {
+      wrapper.appendChild(reasoningToggle);
+    }
   }
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = text;
+  appendRichText(bubble, text);
 
   wrapper.appendChild(bubble);
   messagesEl.appendChild(wrapper);
@@ -105,12 +210,20 @@ function setProgressStage(progressBubble, stageText) {
   progressBubble.label.textContent = stageText;
 }
 
-function finalizeProgressBubble(progressBubble, finalText) {
+function finalizeProgressBubble(progressBubble, finalText, reasoning = null) {
   if (!progressBubble?.bubble) {
     return;
   }
+  const existingToggle = progressBubble.wrapper.querySelector(".reasoning-toggle");
+  if (existingToggle) {
+    existingToggle.remove();
+  }
+  const reasoningToggle = createReasoningToggle(reasoning);
+  if (reasoningToggle) {
+    progressBubble.wrapper.insertBefore(reasoningToggle, progressBubble.bubble);
+  }
   progressBubble.bubble.classList.remove("loading");
-  progressBubble.bubble.textContent = finalText;
+  appendRichText(progressBubble.bubble, finalText);
 }
 
 function setGeneratingState(isGenerating) {
@@ -299,6 +412,7 @@ async function openConversation(conversationId) {
   activeConversationId = conversationId;
   showStarters = false;
   activeFollowUps = [];
+  closePreviewPanel();
 
   const response = await fetch(`/api/conversations/${conversationId}/messages`);
   if (!response.ok) {
@@ -385,7 +499,7 @@ async function sendChat(messageText) {
 
     activeConversationId = finalPayload.conversation_id;
     const finalAnswer = finalPayload.answer || "답변이 없습니다.";
-    finalizeProgressBubble(progressBubble, finalAnswer);
+    finalizeProgressBubble(progressBubble, finalAnswer, finalPayload.reasoning || null);
     activeMessages.push({
       role: "assistant",
       text: finalAnswer,
@@ -473,6 +587,7 @@ function createConversation() {
   activeMessages = [];
   activeFollowUps = [];
   showStarters = true;
+  closePreviewPanel();
   renderHistoryList();
   renderMessages();
 }
@@ -499,6 +614,10 @@ confirmDeleteYesEl.addEventListener("click", () => {
 
 confirmDeleteNoEl.addEventListener("click", () => {
   closeDeleteModal();
+});
+
+previewCloseButtonEl.addEventListener("click", () => {
+  closePreviewPanel();
 });
 
 async function init() {
