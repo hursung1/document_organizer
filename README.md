@@ -7,7 +7,7 @@
 - PDF 문서를 GLM-OCR로 파싱하고 Milvus(`doc_chunks`)에 적재
 - ArXiv 논문을 매일 오전 9시(KST) 기준으로 갱신
   - 수집 대상: **KST 전날** 제출 논문
-  - 키워드별 수집 후 중복 제거
+  - 카테고리별 수집 후 중복 제거
   - JSON 저장 + Milvus(`arxiv_papers`) 적재
 - 대화형 RAG API
   - 일반 응답: `POST /api/chat`
@@ -65,6 +65,7 @@ uv run python model.py
   - OCR 적재 수동 실행
 - `POST /arxiv/run`
   - ArXiv 수집 + Milvus 적재 수동 실행
+  - 실행 시점 기준 최근 30일 데이터를 일 단위 JSON으로 정리 후 적재
 - `GET /api/starter-docs`
   - 새 채팅 카드용 문서 3개 반환
 - `GET /api/conversations`
@@ -87,6 +88,8 @@ uv run python model.py
 - 수집 결과 저장
   - `/Users/seonghwan/projects/doc_organizer/results/arxiv/YYYY-MM-DD.json`
   - `/Users/seonghwan/projects/doc_organizer/results/arxiv/_state.json`
+- 수동 백필(`/arxiv/run`)
+  - 최근 30일을 일자별로 수집/정리하며, JSON 파일 구조는 동일하게 유지
 - Milvus 적재 방식
   - 임베딩 입력: `title + summary` 결합 텍스트
   - metadata: `arxiv_id`, `published`, `updated`, `authors`, `categories`, `pdf_url`, `source_url`, `matched_topics`, `ingested_at`
@@ -132,8 +135,13 @@ uv run python model.py
 - `ARXIV_STORAGE_DIR` (기본: `results/arxiv`)
 - `ARXIV_COLLECTION` (기본: `arxiv_papers`)
 - `ARXIV_SCHEDULE_HOUR` (기본: `9`)
-- `ARXIV_MAX_RESULTS_PER_TOPIC` (기본: `50`)
-- `ARXIV_TOPICS` (기본: `computer science,artificial intelligence,large language model,LLM`)
+- `ARXIV_MAX_RESULTS_PER_TOPIC` (기본: `50`, 카테고리 쿼리당 최대 결과 수)
+- `ARXIV_CATEGORIES` (기본: `cs.AI,cs.CV,cs.DB,cs.DS,cs.ET,cs.IR,cs.IT,cs.LG,cs.MA,cs.NE,cs.RO,cs.SI`)
+- `ARXIV_USER_AGENT` (기본: `doc-organizer/0.1 (arxiv-client)`)
+- `ARXIV_REQUEST_TIMEOUT_SEC` (기본: `30`)
+- `ARXIV_RETRY_MAX_ATTEMPTS` (기본: `5`)
+- `ARXIV_RETRY_BASE_DELAY_SEC` (기본: `2.0`)
+- `ARXIV_MIN_REQUEST_INTERVAL_SEC` (기본: `3.0`, 연속 호출 최소 간격)
 
 ### ArXiv PDF 원문 보강(질의응답 시)
 

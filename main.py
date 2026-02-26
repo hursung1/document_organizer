@@ -477,16 +477,41 @@ async def _run_arxiv_update(trigger: str) -> dict[str, Any]:
         runtime_state["arxiv_running"] = True
         runtime_state["arxiv_last_error"] = None
         try:
-            summary = await asyncio.to_thread(arxiv_service.run_once)
-            milvus_summary = await asyncio.to_thread(
-                arxiv_milvus_service.upsert_from_file,
-                Path(summary.output_file),
-            )
+            if trigger == "manual":
+                summary = await asyncio.to_thread(arxiv_service.run_last_month, None, 30)
+                output_files = [Path(path) for path in summary.output_files]
+            else:
+                summary = await asyncio.to_thread(arxiv_service.run_once)
+                output_files = [Path(summary.output_file)]
+
+            milvus_runs: list[dict[str, Any]] = []
+            milvus_aggregated = {
+                "files_processed": len(output_files),
+                "total_papers": 0,
+                "embedded_papers": 0,
+                "upserted_papers": 0,
+                "failed_papers": 0,
+                "collection_name": settings.arxiv_collection_name,
+            }
+            for output_file in output_files:
+                milvus_summary = await asyncio.to_thread(
+                    arxiv_milvus_service.upsert_from_file,
+                    output_file,
+                )
+                run_item = milvus_summary.to_dict() | {"output_file": str(output_file)}
+                milvus_runs.append(run_item)
+                milvus_aggregated["total_papers"] += milvus_summary.total_papers
+                milvus_aggregated["embedded_papers"] += milvus_summary.embedded_papers
+                milvus_aggregated["upserted_papers"] += milvus_summary.upserted_papers
+                milvus_aggregated["failed_papers"] += milvus_summary.failed_papers
+
             runtime_state["arxiv_last_run_at"] = datetime.now(UTC).isoformat()
             runtime_state["arxiv_last_summary"] = summary.to_dict() | {
-                "milvus": milvus_summary.to_dict()
+                "milvus": milvus_aggregated,
             }
-            runtime_state["arxiv_last_milvus_summary"] = milvus_summary.to_dict()
+            runtime_state["arxiv_last_milvus_summary"] = milvus_aggregated | {
+                "runs": milvus_runs,
+            }
             return {
                 "trigger": trigger,
                 "run_at": runtime_state["arxiv_last_run_at"],

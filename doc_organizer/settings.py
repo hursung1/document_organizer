@@ -33,12 +33,12 @@ class IngestionSettings:
     arxiv_collection_name: str = "arxiv_papers"
     arxiv_schedule_hour: int = 9
     arxiv_max_results_per_topic: int = 50
-    arxiv_topics: tuple[str, ...] = (
-        "computer science",
-        "artificial intelligence",
-        "large language model",
-        "LLM",
-    )
+    arxiv_categories: tuple[str, ...] = ("cs.AI", "cs.CV", "cs.DB", "cs.DS", "cs.ET", "cs.IR", "cs.IT", "cs.LG", "cs.MA", "cs.NE", "cs.RO", "cs.SI")
+    arxiv_user_agent: str = "doc-organizer/0.1 (arxiv-client)"
+    arxiv_request_timeout_sec: int = 30
+    arxiv_retry_max_attempts: int = 5
+    arxiv_retry_base_delay_sec: float = 2.0
+    arxiv_min_request_interval_sec: float = 5.0
     arxiv_pdf_enrich_enabled: bool = True
     arxiv_pdf_cache_dir: Path = Path("results/arxiv/pdf_cache")
     arxiv_pdf_cache_ttl_hours: int = 168
@@ -83,13 +83,20 @@ class IngestionSettings:
             arxiv_collection_name=os.getenv("ARXIV_COLLECTION", "arxiv_papers"),
             arxiv_schedule_hour=int(os.getenv("ARXIV_SCHEDULE_HOUR", "9")),
             arxiv_max_results_per_topic=int(os.getenv("ARXIV_MAX_RESULTS_PER_TOPIC", "50")),
-            arxiv_topics=tuple(
-                topic.strip()
-                for topic in os.getenv(
-                    "ARXIV_TOPICS",
-                    "computer science,artificial intelligence,large language model,LLM",
+            arxiv_categories=tuple(
+                category.strip()
+                for category in os.getenv(
+                    "ARXIV_CATEGORIES",
+                    "cs.AI,cs.CV,cs.DB,cs.DS,cs.ET,cs.IR,cs.IT,cs.LG,cs.MA,cs.NE,cs.RO,cs.SI",
                 ).split(",")
-                if topic.strip()
+                if category.strip()
+            ),
+            arxiv_user_agent=os.getenv("ARXIV_USER_AGENT", "doc-organizer/0.1 (arxiv-client)"),
+            arxiv_request_timeout_sec=int(os.getenv("ARXIV_REQUEST_TIMEOUT_SEC", "30")),
+            arxiv_retry_max_attempts=int(os.getenv("ARXIV_RETRY_MAX_ATTEMPTS", "5")),
+            arxiv_retry_base_delay_sec=float(os.getenv("ARXIV_RETRY_BASE_DELAY_SEC", "2.0")),
+            arxiv_min_request_interval_sec=float(
+                os.getenv("ARXIV_MIN_REQUEST_INTERVAL_SEC", "3.0")
             ),
             arxiv_pdf_enrich_enabled=os.getenv("ARXIV_PDF_ENRICH_ENABLED", "true").lower()
             in {"1", "true", "yes", "on"},
