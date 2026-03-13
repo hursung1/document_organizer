@@ -317,6 +317,7 @@ body {
   border-top: 1px solid var(--border);
   padding: 14px 20px 20px;
   display: flex;
+  align-items: stretch;
   gap: 10px;
   background: #fff;
 }
@@ -330,6 +331,11 @@ body {
   font: inherit;
 }
 
+.composer-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .composer button {
   border: 0;
   border-radius: 12px;
@@ -337,11 +343,20 @@ body {
   background: var(--primary);
   color: #fff;
   cursor: pointer;
+  min-width: 72px;
 }
 
 .composer button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.composer button.stop {
+  background: #dc2626;
+}
+
+.composer button.stop:hover {
+  background: #b91c1c;
 }
 
 .preview-panel {

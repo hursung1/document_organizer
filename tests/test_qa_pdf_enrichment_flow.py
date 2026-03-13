@@ -55,6 +55,27 @@ class QaPdfEnrichmentFlowTests(unittest.TestCase):
         )
         self.assertFalse(needed)
 
+    def test_needs_pdf_enrichment_true_for_detail_question(self) -> None:
+        retrieved = [
+            RetrievalResult(
+                id=str(idx),
+                score=0.95,
+                source=f"2501.0123{idx}",
+                chunk_id=idx,
+                text="content",
+                arxiv_id=f"2501.0123{idx}",
+            )
+            for idx in range(5)
+        ]
+
+        needed = DocumentQAService._needs_pdf_enrichment(
+            message="이 논문 내용을 상세하게, 본문 기준으로 자세히 설명해줘",
+            retrieved=retrieved,
+            top_k=5,
+            min_score=0.35,
+        )
+        self.assertTrue(needed)
+
     def test_route_doc_base_when_pdf_evidence_exists(self) -> None:
         service = DocumentQAService.__new__(DocumentQAService)
         route = service._conditional_edge_doc_base_or_not(

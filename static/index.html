@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Doc Organizer Chat</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260225c" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260225d" />
   </head>
   <body>
     <div class="app-shell">
@@ -32,7 +32,10 @@
 
         <form id="chatForm" class="composer">
           <textarea id="userInput" placeholder="질문을 입력하세요" rows="1"></textarea>
-          <button type="submit">전송</button>
+          <div class="composer-actions">
+            <button id="sendButton" type="submit">전송</button>
+            <button id="stopButton" type="button" class="stop hidden">중지</button>
+          </div>
         </form>
       </main>
 
@@ -62,6 +65,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=20260225c" defer></script>
+    <script src="/static/app.js?v=20260225d" defer></script>
   </body>
 </html>

@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 ENRICH_TRIGGER_SIGNALS = (
     "원문",
     "본문",
+    "상세",
+    "자세히",
+    "구체",
+    "깊게",
+    "디테일",
+    "세부",
     "수식",
     "실험",
     "ablation",
@@ -525,18 +531,31 @@ class DocumentQAService:
                 "Async Redis checkpointer import failed. Install langgraph-checkpoint-redis."
             ) from exc
 
-        if hasattr(AsyncRedisSaver, "from_conn_string"):
-            acm = AsyncRedisSaver.from_conn_string(self.settings.redis_url)
-            saver = await acm.__aenter__()
+        try:
+            if hasattr(AsyncRedisSaver, "from_conn_string"):
+                acm = AsyncRedisSaver.from_conn_string(self.settings.redis_url)
+                saver = await acm.__aenter__()
+                await saver.asetup()
+                self._checkpointer_acm = acm
+                self._checkpointer = saver
+                return saver
+
+            saver = AsyncRedisSaver(redis_url=self.settings.redis_url)
             await saver.asetup()
-            self._checkpointer_acm = acm
             self._checkpointer = saver
             return saver
+        except Exception as exc:
+            if self._checkpointer_acm is not None:
+                await self._checkpointer_acm.__aexit__(type(exc), exc, exc.__traceback__)
+                self._checkpointer_acm = None
+            logger.warning(
+                "Redis checkpointer unavailable; falling back to in-memory saver: %s",
+                exc,
+            )
+            from langgraph.checkpoint.memory import InMemorySaver
 
-        saver = AsyncRedisSaver(redis_url=self.settings.redis_url)
-        await saver.asetup()
-        self._checkpointer = saver
-        return saver
+            self._checkpointer = InMemorySaver()
+            return self._checkpointer
 
     async def aclose(self) -> None:
         if self._checkpointer_acm is not None:
@@ -780,6 +799,8 @@ class DocumentQAService:
         has_arxiv = any((item.arxiv_id or "").strip() for item in retrieved)
         if not has_arxiv:
             return False
+        if cls._is_detail_question(message):
+            return True
         if len(retrieved) < top_k:
             return True
         top_score = float(retrieved[0].score)
@@ -788,10 +809,21 @@ class DocumentQAService:
         lowered = (message or "").lower()
         return any(signal.lower() in lowered for signal in ENRICH_TRIGGER_SIGNALS)
 
+    @staticmethod
+    def _is_detail_question(message: str) -> bool:
+        lowered = (message or "").lower()
+        return any(signal.lower() in lowered for signal in ENRICH_TRIGGER_SIGNALS)
+
     async def _node_enrich_with_arxiv_pdf(self, state: RAGState) -> RAGState:
         retrieved = state.get("retrieved") or []
         message = str(state.get("message") or "")
         analyzed = state.get("analyzed_query")
+        detail_question = self._is_detail_question(message)
+        retrieved_for_enrich = self._augment_retrieval_with_message_arxiv_id(
+            retrieved=retrieved,
+            message=message,
+            only_when_detail=detail_question,
+        )
 
         if not self.settings.arxiv_pdf_enrich_enabled:
             return {
@@ -806,7 +838,7 @@ class DocumentQAService:
 
         should_enrich = self._needs_pdf_enrichment(
             message=message,
-            retrieved=retrieved,
+            retrieved=retrieved_for_enrich,
             top_k=self.settings.retrieval_top_k,
             min_score=self.settings.arxiv_pdf_min_score,
         )
@@ -823,7 +855,7 @@ class DocumentQAService:
             evidences = await self.pdf_enricher.enrich(
                 query=message,
                 analyzed_query=analyzed,
-                retrieved_docs=retrieved,
+                retrieved_docs=retrieved_for_enrich,
             )
             return {
                 "pdf_evidence": evidences,
@@ -841,6 +873,33 @@ class DocumentQAService:
                 "pdf_download_fail_count": self.pdf_enricher.last_metrics.download_fail_count,
                 "pdf_enrich_error": str(exc),
             }
+
+    def _augment_retrieval_with_message_arxiv_id(
+        self,
+        retrieved: list[RetrievalResult],
+        message: str,
+        only_when_detail: bool,
+    ) -> list[RetrievalResult]:
+        if not only_when_detail:
+            return retrieved
+        arxiv_id = self._extract_arxiv_id(message)
+        if not arxiv_id:
+            return retrieved
+        if any((item.arxiv_id or "").strip() == arxiv_id for item in retrieved):
+            return retrieved
+
+        synthetic = RetrievalResult(
+            id=f"message:{arxiv_id}",
+            score=1.0,
+            source=f"arXiv:{arxiv_id}",
+            chunk_id=0,
+            text="",
+            arxiv_id=arxiv_id,
+            pdf_url=self._build_pdf_url(arxiv_id),
+            source_url=f"https://arxiv.org/abs/{arxiv_id}",
+            metadata={"arxiv_id": arxiv_id},
+        )
+        return [synthetic, *retrieved]
 
     def _fallback_retrieve_from_arxiv_files(
         self,

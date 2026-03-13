@@ -5,6 +5,51 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _load_dotenv() -> None:
+    for candidate in _dotenv_candidates():
+        if not candidate.exists():
+            continue
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            os.environ.setdefault(key, _parse_dotenv_value(value))
+        return
+
+
+def _dotenv_candidates() -> tuple[Path, ...]:
+    project_root = Path(__file__).resolve().parent.parent
+    candidates = [
+        Path.cwd() / ".env",
+        project_root / ".env",
+    ]
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(candidate)
+    return tuple(unique)
+
+
+def _parse_dotenv_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
 @dataclass(slots=True)
 class IngestionSettings:
     docs_dir: Path = Path("src_docs")
@@ -47,9 +92,11 @@ class IngestionSettings:
     arxiv_pdf_min_score: float = 0.35
     arxiv_pdf_download_timeout_sec: int = 30
     arxiv_pdf_extract_max_chars: int = 120000
+    arxiv_pdf_ocr_model: str = "glm-ocr:latest"
 
     @classmethod
     def from_env(cls) -> IngestionSettings:
+        _load_dotenv()
         qa_model = os.getenv("QA_MODEL", "qwen3:latest")
         ollama_reasoning = cls._parse_ollama_reasoning(
             os.getenv("OLLAMA_REASONING"),
@@ -115,6 +162,7 @@ class IngestionSettings:
             arxiv_pdf_extract_max_chars=int(
                 os.getenv("ARXIV_PDF_EXTRACT_MAX_CHARS", "120000")
             ),
+            arxiv_pdf_ocr_model=os.getenv("ARXIV_PDF_OCR_MODEL", "glm-ocr:latest"),
         )
 
     def ensure_directories(self) -> None:
