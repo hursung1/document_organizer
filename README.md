@@ -64,8 +64,9 @@ uv run python model.py
 - `POST /ingest/run`
   - OCR 적재 수동 실행
 - `POST /arxiv/run`
+  - query param: `lookback_days` (기본 `10`)
   - ArXiv 수집 + Milvus 적재 수동 실행
-  - 실행 시점 기준 최근 30일 데이터를 일 단위 JSON으로 정리 후 적재
+  - 실행 시점 기준 어제까지 최근 10일 데이터를 기본으로 일 단위 JSON으로 정리 후 적재
 - `GET /api/starter-docs`
   - 새 채팅 카드용 문서 3개 반환
 - `GET /api/conversations`
@@ -89,13 +90,16 @@ uv run python model.py
   - `/Users/seonghwan/projects/doc_organizer/results/arxiv/YYYY-MM-DD.json`
   - `/Users/seonghwan/projects/doc_organizer/results/arxiv/_state.json`
 - 수동 백필(`/arxiv/run`)
-  - 최근 30일을 일자별로 수집/정리하며, JSON 파일 구조는 동일하게 유지
+  - 어제까지 최근 10일을 기본으로 일자별 수집/정리하며, `lookback_days` 요청 파라미터로 기간을 바꿀 수 있음
+  - 비어 있지 않은 일별 JSON이 있으면 해당 날짜는 재조회하지 않고 재사용
 - Milvus 적재 방식
   - 임베딩 입력: `title + summary` 결합 텍스트
   - metadata: `arxiv_id`, `published`, `updated`, `authors`, `categories`, `pdf_url`, `source_url`, `matched_topics`, `ingested_at`
   - 컬렉션: `ARXIV_COLLECTION` (기본 `arxiv_papers`)
 
 ## 환경변수
+
+- 앱은 프로젝트 루트의 `.env`를 자동으로 읽고, 이미 셸에 설정된 값이 있으면 그 값을 우선 사용
 
 ### 공통 경로/입출력
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 import re
@@ -11,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -48,6 +49,13 @@ runtime_state: dict[str, Any] = {
     "arxiv_last_error": None,
     "arxiv_last_milvus_summary": None,
 }
+starter_summary_llm: Any | None = None
+starter_summary_llm_initialized = False
+starter_summary_cache: dict[str, str] = {}
+ARXIV_MANUAL_LOOKBACK_DAYS_DEFAULT = 10
+STARTER_SUMMARY_SENTENCE_COUNT = 3
+STARTER_SUMMARY_MAX_CHARS = 2400
+STARTER_SUMMARY_CACHE_LIMIT = 512
 
 
 class StarterDoc(BaseModel):
@@ -319,6 +327,179 @@ def _korean_one_sentence_summary(title: str, body: str) -> str:
     return f"{clean_title} 문서는 핵심 내용과 의의를 간결하게 정리한 문서다."
 
 
+def _coerce_llm_content(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_coerce_llm_content(item) for item in value]
+        return "\n".join([part for part in parts if part]).strip()
+    if isinstance(value, dict):
+        preferred_keys = ("text", "content", "summary", "output_text", "message", "answer")
+        parts: list[str] = []
+        for key in preferred_keys:
+            if key in value:
+                text = _coerce_llm_content(value.get(key))
+                if text:
+                    parts.append(text)
+        if parts:
+            return "\n".join(parts).strip()
+        nested = [_coerce_llm_content(item) for item in value.values()]
+        return "\n".join([part for part in nested if part]).strip()
+    return str(value).strip()
+
+
+def _ensure_sentence_end(text: str) -> str:
+    trimmed = _normalize_space(text)
+    if not trimmed:
+        return ""
+    if trimmed.endswith((".", "!", "?", "다", "요")):
+        return trimmed
+    return f"{trimmed}."
+
+
+def _pick_summary_sentences(text: str, limit: int = STARTER_SUMMARY_SENTENCE_COUNT) -> list[str]:
+    sentences: list[str] = []
+    for sentence in _split_sentences(text):
+        cleaned = re.sub(r"^[\-\*\d\.\)\s]+", "", sentence)
+        cleaned = _ensure_sentence_end(cleaned)
+        if not cleaned:
+            continue
+        sentences.append(cleaned)
+        if len(sentences) >= limit:
+            break
+    return sentences
+
+
+def _fallback_starter_summary(title: str, summary: str) -> str:
+    base = _pick_summary_sentences(summary, STARTER_SUMMARY_SENTENCE_COUNT)
+    generic = [
+        f"{_normalize_space(title) or '이 논문'}은 핵심 문제와 해결 아이디어를 간결하게 제시한다.",
+        "핵심 방법과 실험 결과를 함께 보면 성능의 근거를 빠르게 파악할 수 있다.",
+        "실제 적용 가능성은 데이터 조건과 계산 비용을 함께 검토해 판단하는 것이 좋다.",
+    ]
+    for sentence in generic:
+        if len(base) >= STARTER_SUMMARY_SENTENCE_COUNT:
+            break
+        base.append(_ensure_sentence_end(sentence))
+    return " ".join(base[:STARTER_SUMMARY_SENTENCE_COUNT])
+
+
+def _build_starter_chat_llm() -> Any | None:
+    provider = (settings.llm_provider or "ollama").strip().lower()
+    if provider == "ollama":
+        try:
+            from langchain_ollama import ChatOllama
+        except Exception:
+            return None
+        return ChatOllama(
+            model=settings.qa_model,
+            base_url=settings.ollama_host,
+            temperature=0,
+            reasoning=settings.ollama_reasoning,
+        )
+    if provider == "gemini":
+        if not settings.gemini_api_key:
+            return None
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except Exception:
+            return None
+        return ChatGoogleGenerativeAI(
+            model=settings.gemini_model,
+            google_api_key=settings.gemini_api_key,
+            temperature=0,
+        )
+    return None
+
+
+def _resolve_starter_chat_llm() -> Any | None:
+    global starter_summary_llm
+    global starter_summary_llm_initialized
+    if starter_summary_llm_initialized:
+        return starter_summary_llm
+    starter_summary_llm_initialized = True
+    starter_summary_llm = _build_starter_chat_llm()
+    return starter_summary_llm
+
+
+def _summarize_arxiv_summary(title: str, summary: str) -> str:
+    clean_summary = _normalize_space(summary)
+    if not clean_summary:
+        return _fallback_starter_summary(title=title, summary=summary)
+    llm = _resolve_starter_chat_llm()
+    if llm is None:
+        return _fallback_starter_summary(title=title, summary=clean_summary)
+
+    source_text = clean_summary[:STARTER_SUMMARY_MAX_CHARS]
+    system_prompt = (
+        "너는 논문 요약 편집자다. 입력된 summary를 한국어 자연문 3문장으로 다시 요약해라.\n"
+        "규칙:\n"
+        "1) 정확히 3문장\n"
+        "2) 각 문장 20~55자 내외\n"
+        "3) 불릿/번호/마크다운 금지\n"
+        "4) 논문 제목을 반복하지 말고 핵심 문제, 방법, 결과를 담을 것"
+    )
+    user_prompt = (
+        f"논문 제목:\n{title}\n\n"
+        f"원본 summary:\n{source_text}\n\n"
+        "한국어 3문장 요약:"
+    )
+
+    try:
+        response = llm.invoke([("system", system_prompt), ("human", user_prompt)])
+        generated = _normalize_space(_coerce_llm_content(getattr(response, "content", "")))
+    except Exception:
+        return _fallback_starter_summary(title=title, summary=source_text)
+
+    candidates = _pick_summary_sentences(generated, STARTER_SUMMARY_SENTENCE_COUNT)
+    if len(candidates) < STARTER_SUMMARY_SENTENCE_COUNT:
+        fallback_sentences = _pick_summary_sentences(source_text, STARTER_SUMMARY_SENTENCE_COUNT)
+        for sentence in fallback_sentences:
+            if len(candidates) >= STARTER_SUMMARY_SENTENCE_COUNT:
+                break
+            if sentence not in candidates:
+                candidates.append(sentence)
+    if len(candidates) < STARTER_SUMMARY_SENTENCE_COUNT:
+        return _fallback_starter_summary(title=title, summary=source_text)
+    return " ".join(candidates[:STARTER_SUMMARY_SENTENCE_COUNT])
+
+
+def _starter_summary_cache_key(doc_id: str, summary: str) -> str:
+    digest = hashlib.sha1(summary.encode("utf-8")).hexdigest()
+    return f"{doc_id}:{digest}"
+
+
+def _format_starter_documents(documents: list[dict[str, str]]) -> list[dict[str, str]]:
+    rendered: list[dict[str, str]] = []
+    for doc in documents:
+        doc_id = _normalize_space(str(doc.get("id", "")))
+        title = _normalize_space(str(doc.get("title", "")))
+        raw_summary = _normalize_space(str(doc.get("raw_summary", "")))
+        summary = _normalize_space(str(doc.get("summary", "")))
+        summary_source = _normalize_space(str(doc.get("summary_source", "")))
+        display_summary = summary
+
+        if summary_source == "arxiv" and doc_id and raw_summary:
+            cache_key = _starter_summary_cache_key(doc_id=doc_id, summary=raw_summary)
+            display_summary = starter_summary_cache.get(cache_key, "")
+            if not display_summary:
+                display_summary = _summarize_arxiv_summary(title=title, summary=raw_summary)
+                if len(starter_summary_cache) >= STARTER_SUMMARY_CACHE_LIMIT:
+                    starter_summary_cache.clear()
+                starter_summary_cache[cache_key] = display_summary
+
+        rendered.append(
+            {
+                "id": doc_id,
+                "title": title,
+                "summary": display_summary or _fallback_starter_summary(title=title, summary=summary),
+            }
+        )
+    return rendered
+
+
 def _build_doc_title(path: Path) -> str:
     return path.stem.replace("_", " ").strip() or path.name
 
@@ -406,7 +587,9 @@ def _load_arxiv_starter_docs(count: int = 3) -> list[dict[str, str]]:
                 {
                     "id": doc_id,
                     "title": title,
-                    "summary": _korean_one_sentence_summary(title=title, body=summary),
+                    "summary": summary,
+                    "raw_summary": summary,
+                    "summary_source": "arxiv",
                 }
             )
 
@@ -465,7 +648,11 @@ async def _periodic_ingestion_loop() -> None:
         await asyncio.sleep(settings.interval_seconds)
 
 
-async def _run_arxiv_update(trigger: str) -> dict[str, Any]:
+async def _run_arxiv_update(
+    trigger: str,
+    *,
+    lookback_days: int = ARXIV_MANUAL_LOOKBACK_DAYS_DEFAULT,
+) -> dict[str, Any]:
     if arxiv_service is None:
         raise HTTPException(status_code=503, detail="ArXiv service is not ready.")
     if arxiv_milvus_service is None:
@@ -478,7 +665,11 @@ async def _run_arxiv_update(trigger: str) -> dict[str, Any]:
         runtime_state["arxiv_last_error"] = None
         try:
             if trigger == "manual":
-                summary = await asyncio.to_thread(arxiv_service.run_last_month, None, 30)
+                summary = await asyncio.to_thread(
+                    arxiv_service.run_last_month,
+                    None,
+                    lookback_days,
+                )
                 output_files = [Path(path) for path in summary.output_files]
             else:
                 summary = await asyncio.to_thread(arxiv_service.run_once)
@@ -624,8 +815,10 @@ async def run_ingest_now() -> dict[str, Any]:
 
 
 @app.post("/arxiv/run")
-async def run_arxiv_now() -> dict[str, Any]:
-    return await _run_arxiv_update(trigger="manual")
+async def run_arxiv_now(
+    lookback_days: int = Query(default=ARXIV_MANUAL_LOOKBACK_DAYS_DEFAULT, ge=1),
+) -> dict[str, Any]:
+    return await _run_arxiv_update(trigger="manual", lookback_days=lookback_days)
 
 
 @app.get("/", response_class=FileResponse)
@@ -639,6 +832,7 @@ async def starter_docs() -> StarterDocsResponse:
     if not documents:
         docs = await asyncio.to_thread(_load_documents)
         documents = _pick_starter_docs(docs, count=3)
+    documents = await asyncio.to_thread(_format_starter_documents, documents)
     return StarterDocsResponse(
         documents=[
             StarterDoc(id=doc["id"], title=doc["title"], summary=doc["summary"])

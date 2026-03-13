@@ -7,7 +7,8 @@ const chatFormEl = document.getElementById("chatForm");
 const userInputEl = document.getElementById("userInput");
 const followUpSectionEl = document.getElementById("followUpSection");
 const followUpChipsEl = document.getElementById("followUpChips");
-const sendButtonEl = chatFormEl.querySelector('button[type="submit"]');
+const sendButtonEl = document.getElementById("sendButton");
+const stopButtonEl = document.getElementById("stopButton");
 const deleteConfirmModalEl = document.getElementById("deleteConfirmModal");
 const confirmDeleteYesEl = document.getElementById("confirmDeleteYes");
 const confirmDeleteNoEl = document.getElementById("confirmDeleteNo");
@@ -25,6 +26,9 @@ let activeMessages = [];
 let activeFollowUps = [];
 let showStarters = true;
 let pendingDeleteConversationId = null;
+let currentStreamAbortController = null;
+let isGenerating = false;
+let stoppedByUser = false;
 const STAGE_LABELS = {
   analyze_query: "질의 분석 중",
   retrieve_docs: "문서 검색 중",
@@ -226,16 +230,39 @@ function finalizeProgressBubble(progressBubble, finalText, reasoning = null) {
   appendRichText(progressBubble.bubble, finalText);
 }
 
-function setGeneratingState(isGenerating) {
+function stopCurrentGeneration() {
+  if (!isGenerating || !currentStreamAbortController) {
+    return;
+  }
+  stoppedByUser = true;
+  currentStreamAbortController.abort();
+}
+
+function isAbortError(error) {
+  if (!error) {
+    return false;
+  }
+  if (error.name === "AbortError") {
+    return true;
+  }
+  return String(error).toLowerCase().includes("aborted");
+}
+
+function setGeneratingState(isGeneratingFlag) {
+  isGenerating = Boolean(isGeneratingFlag);
   if (isGenerating) {
     userInputEl.setAttribute("aria-busy", "true");
     sendButtonEl.disabled = true;
     sendButtonEl.textContent = "생성 중";
+    stopButtonEl.classList.remove("hidden");
+    stopButtonEl.disabled = false;
     return;
   }
   userInputEl.setAttribute("aria-busy", "false");
   sendButtonEl.disabled = false;
   sendButtonEl.textContent = "전송";
+  stopButtonEl.disabled = true;
+  stopButtonEl.classList.add("hidden");
 }
 
 function renderFollowUps(questions) {
@@ -354,7 +381,11 @@ function renderStarterButtons(container) {
     const card = document.createElement("button");
     card.type = "button";
     card.className = "starter-card";
-    card.innerHTML = `<h4>${doc.title}</h4><p>${doc.summary}</p>`;
+    const title = document.createElement("h4");
+    title.textContent = doc.title || "제목 없음";
+    const summary = document.createElement("p");
+    summary.textContent = doc.summary || "요약 정보가 없습니다.";
+    card.append(title, summary);
     card.addEventListener("click", () => handleStarterClick(doc));
     container.appendChild(card);
   });
@@ -409,6 +440,7 @@ async function refreshConversations() {
 }
 
 async function openConversation(conversationId) {
+  stopCurrentGeneration();
   activeConversationId = conversationId;
   showStarters = false;
   activeFollowUps = [];
@@ -429,6 +461,9 @@ async function openConversation(conversationId) {
 }
 
 async function sendChat(messageText) {
+  if (isGenerating) {
+    return;
+  }
   const message = (messageText || "").trim();
   if (!message) {
     return;
@@ -443,16 +478,21 @@ async function sendChat(messageText) {
     created_at: new Date().toISOString(),
   };
   activeMessages.push(userMessage);
+  const requestMessagesRef = activeMessages;
   activeFollowUps = [];
   renderMessages();
 
   userInputEl.value = "";
   const progressBubble = appendProgressBubble("질의 분석 중");
+  const abortController = new AbortController();
+  currentStreamAbortController = abortController;
+  stoppedByUser = false;
   setGeneratingState(true);
 
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
+      signal: abortController.signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message,
@@ -496,6 +536,9 @@ async function sendChat(messageText) {
     if (!finalPayload) {
       throw new Error("최종 답변 이벤트를 받지 못했습니다.");
     }
+    if (activeMessages !== requestMessagesRef) {
+      return;
+    }
 
     activeConversationId = finalPayload.conversation_id;
     const finalAnswer = finalPayload.answer || "답변이 없습니다.";
@@ -511,6 +554,22 @@ async function sendChat(messageText) {
     await refreshConversations();
     renderMessages();
   } catch (error) {
+    if (activeMessages !== requestMessagesRef) {
+      return;
+    }
+    if (stoppedByUser || isAbortError(error)) {
+      const stoppedText = "답변 생성을 중지했습니다.";
+      finalizeProgressBubble(progressBubble, stoppedText);
+      activeMessages.push({
+        role: "assistant",
+        text: stoppedText,
+        reasoning: null,
+        created_at: new Date().toISOString(),
+      });
+      activeFollowUps = [];
+      renderMessages();
+      return;
+    }
     const errorText = error instanceof Error ? error.message : String(error);
     const finalError = `답변 생성 중 오류가 발생했습니다: ${errorText}`;
     finalizeProgressBubble(progressBubble, finalError);
@@ -523,6 +582,8 @@ async function sendChat(messageText) {
     activeFollowUps = [];
     renderMessages();
   } finally {
+    currentStreamAbortController = null;
+    stoppedByUser = false;
     setGeneratingState(false);
   }
 }
@@ -583,6 +644,7 @@ async function handleStarterClick(doc) {
 }
 
 function createConversation() {
+  stopCurrentGeneration();
   activeConversationId = null;
   activeMessages = [];
   activeFollowUps = [];
@@ -618,6 +680,10 @@ confirmDeleteNoEl.addEventListener("click", () => {
 
 previewCloseButtonEl.addEventListener("click", () => {
   closePreviewPanel();
+});
+
+stopButtonEl.addEventListener("click", () => {
+  stopCurrentGeneration();
 });
 
 async function init() {

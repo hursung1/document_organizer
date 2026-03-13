@@ -260,7 +260,11 @@ class ArxivPdfEnricher:
             from glmocr import GlmOcr
         except Exception as exc:
             raise RuntimeError("glmocr import failed. Install glmocr to enable PDF enrichment.") from exc
-        with GlmOcr(config_path=self.settings.ocr_config_path) as parser:
+        with GlmOcr(
+            config_path=self.settings.ocr_config_path,
+            mode="selfhosted",
+            model=self.settings.arxiv_pdf_ocr_model,
+        ) as parser:
             result = parser.parse(str(pdf_path))
             text = self._extract_text(result.json_result, result.markdown_result)
         return text

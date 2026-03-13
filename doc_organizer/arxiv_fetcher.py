@@ -86,7 +86,7 @@ class ArxivFetcherService:
     ) -> ArxivBackfillSummary:
         now_kst = (target_dt.astimezone(KST) if target_dt else datetime.now(KST))
         days = max(1, lookback_days)
-        end_date = now_kst.date()
+        end_date = now_kst.date() - timedelta(days=1)
         start_date = end_date - timedelta(days=days - 1)
 
         by_topic_total: dict[str, int] = {
@@ -143,6 +143,18 @@ class ArxivFetcherService:
         run_at: datetime,
         save_state: bool,
     ) -> ArxivFetchSummary:
+        output_path = self._daily_file_path(target_date)
+        previous = self._load_daily(output_path)
+        if previous:
+            summary = self._build_cached_summary(
+                target_date=target_date,
+                output_path=output_path,
+                papers=previous,
+            )
+            if save_state:
+                self._save_state(summary=summary, run_at=run_at)
+            return summary
+
         day_token = target_date.strftime("%Y%m%d")
 
         fetched_total = 0
@@ -164,8 +176,6 @@ class ArxivFetcherService:
                 merged_topics = sorted(set(existing.matched_topics + paper.matched_topics))
                 existing.matched_topics = merged_topics
 
-        output_path = self._daily_file_path(target_date)
-        previous = self._load_daily(output_path)
         previous_ids = set(previous.keys())
 
         for arxiv_id, paper in previous.items():
@@ -198,6 +208,27 @@ class ArxivFetcherService:
         if save_state:
             self._save_state(summary=summary, run_at=run_at)
         return summary
+
+    def _build_cached_summary(
+        self,
+        target_date: date,
+        output_path: Path,
+        papers: dict[str, ArxivPaper],
+    ) -> ArxivFetchSummary:
+        by_topic = {f"cat:{category}": 0 for category in self.settings.arxiv_categories}
+        for paper in papers.values():
+            for label in self._category_labels_for_paper(paper):
+                by_topic[label] = by_topic.get(label, 0) + 1
+
+        return ArxivFetchSummary(
+            target_date=target_date.isoformat(),
+            fetched_count=0,
+            unique_count=len(papers),
+            new_count=0,
+            stored_total=len(papers),
+            by_topic=by_topic,
+            output_file=str(output_path),
+        )
 
     def should_run(self, now: datetime | None = None) -> bool:
         current_kst = (now.astimezone(KST) if now else datetime.now(KST))
@@ -359,6 +390,26 @@ class ArxivFetcherService:
         if text is None:
             return ""
         return " ".join(text.split())
+
+    def _category_labels_for_paper(self, paper: ArxivPaper) -> list[str]:
+        labels = sorted(
+            {
+                str(label).strip()
+                for label in paper.matched_topics
+                if str(label).strip().startswith("cat:")
+            }
+        )
+        if labels:
+            return labels
+
+        configured_categories = set(self.settings.arxiv_categories)
+        return sorted(
+            {
+                f"cat:{category}"
+                for category in paper.categories
+                if category in configured_categories
+            }
+        )
 
     def _daily_file_path(self, target_date: date) -> Path:
         return self.settings.arxiv_storage_dir / f"{target_date.isoformat()}.json"
