@@ -19,12 +19,12 @@
 
 ## 프로젝트 구조
 
-- `/Users/seonghwan/projects/doc_organizer/main.py`: FastAPI 앱, 스케줄러, API 엔드포인트
-- `/Users/seonghwan/projects/doc_organizer/doc_organizer/ingest.py`: OCR 문서 적재 서비스
-- `/Users/seonghwan/projects/doc_organizer/doc_organizer/arxiv_fetcher.py`: ArXiv 수집 서비스
-- `/Users/seonghwan/projects/doc_organizer/doc_organizer/arxiv_ingest.py`: ArXiv -> Milvus 적재 서비스
-- `/Users/seonghwan/projects/doc_organizer/doc_organizer/qa_service.py`: RAG 질의응답 서비스
-- `/Users/seonghwan/projects/doc_organizer/doc_organizer/settings.py`: 환경변수/설정 로더
+- `main.py`: FastAPI 앱, 스케줄러, API 엔드포인트
+- `doc_organizer/ingest.py`: OCR 문서 적재 서비스
+- `doc_organizer/arxiv_fetcher.py`: ArXiv 수집 서비스
+- `doc_organizer/arxiv_ingest.py`: ArXiv -> Milvus 적재 서비스
+- `doc_organizer/qa_service.py`: RAG 질의응답 서비스
+- `doc_organizer/settings.py`: 환경변수/설정 로더
 
 ## 요구 사항
 
@@ -87,10 +87,11 @@ uv run python model.py
   - 현재 시간이 `ARXIV_SCHEDULE_HOUR`(기본 9시, KST) 이후이고,
   - 전날(KST) 수집 성공 기록이 없으면 즉시 실행
 - 수집 결과 저장
-  - `/Users/seonghwan/projects/doc_organizer/results/arxiv/YYYY-MM-DD.json`
-  - `/Users/seonghwan/projects/doc_organizer/results/arxiv/_state.json`
+  - `results/arxiv/YYYY-MM-DD.json`
+  - `results/arxiv/_state.json`
 - 수동 백필(`/arxiv/run`)
   - 어제까지 최근 10일을 기본으로 일자별 수집/정리하며, `lookback_days` 요청 파라미터로 기간을 바꿀 수 있음
+  - arXiv 조회는 `submittedDate`를 대상일 ±1일로 넓게 조회한 뒤, `published/updated`를 KST 기준으로 대상일과 일치하는 문서만 반영
   - 비어 있지 않은 일별 JSON이 있으면 해당 날짜는 재조회하지 않고 재사용
 - Milvus 적재 방식
   - 임베딩 입력: `title + summary` 결합 텍스트
