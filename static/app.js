@@ -29,6 +29,9 @@ let pendingDeleteConversationId = null;
 let currentStreamAbortController = null;
 let isGenerating = false;
 let stoppedByUser = false;
+let starterSummaryRequestVersion = 0;
+const STARTER_SUMMARY_MAX_CONCURRENCY = 2;
+const starterSummaryAbortControllers = new Set();
 const STAGE_LABELS = {
   analyze_query: "질의 분석 중",
   retrieve_docs: "문서 검색 중",
@@ -377,18 +380,247 @@ async function confirmDeleteConversation() {
 
 function renderStarterButtons(container) {
   container.innerHTML = "";
-  starterDocs.forEach((doc) => {
+  starterDocs.forEach((doc, index) => {
+    if (!doc.visible) {
+      return;
+    }
     const card = document.createElement("button");
     card.type = "button";
     card.className = "starter-card";
+    card.dataset.starterIndex = String(index);
+    card.disabled = !doc.summary_ready;
     const title = document.createElement("h4");
     title.textContent = doc.title || "제목 없음";
     const summary = document.createElement("p");
-    summary.textContent = doc.summary || "요약 정보가 없습니다.";
+    const summaryReady = Boolean(doc.summary_ready);
+    summary.textContent = summaryReady ? (doc.summary || "요약 정보가 없습니다.") : (doc.summary || "");
+    if (!summaryReady) {
+      summary.classList.add("streaming");
+    }
     card.append(title, summary);
     card.addEventListener("click", () => handleStarterClick(doc));
     container.appendChild(card);
   });
+}
+
+function getStarterCardsContainer() {
+  return messagesEl.querySelector("#starterCards");
+}
+
+function ensureStarterCard(index) {
+  const container = getStarterCardsContainer();
+  if (!container) {
+    return null;
+  }
+  const existing = container.querySelector(`.starter-card[data-starter-index="${index}"]`);
+  if (existing) {
+    return existing;
+  }
+  const doc = starterDocs[index];
+  if (!doc) {
+    return null;
+  }
+  const card = document.createElement("button");
+  card.type = "button";
+  card.className = "starter-card";
+  card.dataset.starterIndex = String(index);
+  card.disabled = !doc.summary_ready;
+  const title = document.createElement("h4");
+  title.textContent = doc.title || "제목 없음";
+  const summary = document.createElement("p");
+  summary.textContent = doc.summary || "";
+  if (!doc.summary_ready) {
+    summary.classList.add("streaming");
+  }
+  card.append(title, summary);
+  card.addEventListener("click", () => handleStarterClick(doc));
+  container.appendChild(card);
+  return card;
+}
+
+function removeStarterCard(index) {
+  const card = messagesEl.querySelector(`.starter-card[data-starter-index="${index}"]`);
+  if (card) {
+    card.remove();
+  }
+}
+
+function setStarterCardSummary(index, text, ready, useFadeIn = true) {
+  const card = ensureStarterCard(index);
+  if (!card) {
+    return;
+  }
+  const summaryEl = card.querySelector("p");
+  summaryEl.textContent = text;
+  summaryEl.classList.remove("streaming", "fade-in");
+  card.disabled = !ready;
+  if (useFadeIn) {
+    void summaryEl.offsetWidth;
+    summaryEl.classList.add("fade-in");
+  }
+}
+
+function appendStarterToken(index, token) {
+  const card = ensureStarterCard(index);
+  if (!card) {
+    return;
+  }
+  const summaryEl = card.querySelector("p");
+  summaryEl.classList.remove("fade-in");
+  summaryEl.classList.add("streaming");
+  card.disabled = true;
+  const chunk = document.createElement("span");
+  chunk.className = "starter-token";
+  chunk.textContent = token;
+  summaryEl.appendChild(chunk);
+}
+
+function abortStarterSummaryStreams() {
+  starterSummaryAbortControllers.forEach((controller) => {
+    try {
+      controller.abort();
+    } catch (error) {
+      // Ignore abort failures.
+    }
+  });
+  starterSummaryAbortControllers.clear();
+}
+
+async function resolveStarterSummaryStream(doc, index, requestVersion) {
+  let completed = false;
+  const streamAbortController = new AbortController();
+  starterSummaryAbortControllers.add(streamAbortController);
+  try {
+    const response = await fetch("/api/starter-docs/summary/stream", {
+      method: "POST",
+      signal: streamAbortController.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: doc.id,
+        title: doc.title,
+        summary: doc.seed_summary || doc.summary || "",
+        raw_summary: doc.raw_summary || "",
+        summary_source: doc.summary_source || "",
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`starter summary ${response.status}`);
+    }
+
+    await consumeSse(response, (eventName, payload) => {
+      if (requestVersion !== starterSummaryRequestVersion) {
+        return;
+      }
+
+      if (eventName === "start") {
+        starterDocs[index].visible = true;
+        starterDocs[index].summary = "";
+        starterDocs[index].summary_ready = false;
+        ensureStarterCard(index);
+        return;
+      }
+
+      if (eventName === "token") {
+        const token = String(payload?.token || "");
+        if (!token) {
+          return;
+        }
+        starterDocs[index].visible = true;
+        starterDocs[index].summary = `${starterDocs[index].summary || ""}${token}`;
+        appendStarterToken(index, token);
+        return;
+      }
+
+      if (eventName === "retry") {
+        starterDocs[index].visible = false;
+        starterDocs[index].summary = "";
+        starterDocs[index].summary_ready = false;
+        removeStarterCard(index);
+        return;
+      }
+
+      if (eventName === "complete") {
+        const summaryText = String(payload?.summary || "").trim();
+        starterDocs[index].visible = true;
+        starterDocs[index].summary = summaryText || "요약 생성 실패";
+        starterDocs[index].summary_ready = Boolean(summaryText);
+        setStarterCardSummary(index, starterDocs[index].summary, starterDocs[index].summary_ready);
+        completed = true;
+        return;
+      }
+
+      if (eventName === "error") {
+        starterDocs[index].visible = true;
+        starterDocs[index].summary = "요약 생성 실패";
+        starterDocs[index].summary_ready = false;
+        setStarterCardSummary(index, "요약 생성 실패", false);
+        completed = true;
+      }
+    });
+  } catch (error) {
+    if (requestVersion !== starterSummaryRequestVersion) {
+      return;
+    }
+    if (isAbortError(error)) {
+      return;
+    }
+    starterDocs[index].visible = true;
+    starterDocs[index].summary = "요약 생성 실패";
+    starterDocs[index].summary_ready = false;
+    setStarterCardSummary(index, "요약 생성 실패", false);
+    completed = true;
+  } finally {
+    starterSummaryAbortControllers.delete(streamAbortController);
+  }
+
+  if (requestVersion === starterSummaryRequestVersion && !completed) {
+    starterDocs[index].visible = true;
+    starterDocs[index].summary = "요약 생성 실패";
+    starterDocs[index].summary_ready = false;
+    setStarterCardSummary(index, "요약 생성 실패", false);
+  }
+}
+
+async function hydrateStarterSummaries(requestVersion) {
+  starterDocs.forEach((doc, index) => {
+    doc.visible = false;
+    doc.summary = "";
+    doc.summary_ready = false;
+  });
+
+  const total = starterDocs.length;
+  if (total === 0) {
+    return;
+  }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(STARTER_SUMMARY_MAX_CONCURRENCY, total);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (requestVersion === starterSummaryRequestVersion) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= total) {
+        return;
+      }
+      const doc = starterDocs[index];
+      await resolveStarterSummaryStream(doc, index, requestVersion);
+    }
+  });
+
+  await Promise.all(workers);
+}
+
+function restartStarterSummaries() {
+  abortStarterSummaryStreams();
+  starterDocs = starterDocs.map((doc) => ({
+    ...doc,
+    summary: "",
+    summary_ready: false,
+    visible: false,
+  }));
+  const requestVersion = ++starterSummaryRequestVersion;
+  void hydrateStarterSummaries(requestVersion);
 }
 
 function renderMessages() {
@@ -424,7 +656,13 @@ function hideStarterCardsImmediately() {
 async function loadStarterDocs() {
   const response = await fetch("/api/starter-docs");
   const payload = await response.json();
-  starterDocs = payload.documents || [];
+  starterDocs = (payload.documents || []).map((doc) => ({
+    ...doc,
+    seed_summary: doc.summary || "",
+    summary: "",
+    summary_ready: false,
+    visible: false,
+  }));
 }
 
 async function refreshConversations() {
@@ -640,7 +878,11 @@ async function consumeSse(response, onEvent) {
 }
 
 async function handleStarterClick(doc) {
-  await sendChat(doc.summary);
+  const prompt =
+    String(doc.summary || "").trim() ||
+    String(doc.raw_summary || "").trim() ||
+    String(doc.title || "").trim();
+  await sendChat(prompt);
 }
 
 function createConversation() {
@@ -652,6 +894,7 @@ function createConversation() {
   closePreviewPanel();
   renderHistoryList();
   renderMessages();
+  restartStarterSummaries();
 }
 
 chatFormEl.addEventListener("submit", async (event) => {

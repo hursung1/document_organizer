@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -155,8 +155,6 @@ class ArxivFetcherService:
                 self._save_state(summary=summary, run_at=run_at)
             return summary
 
-        day_token = target_date.strftime("%Y%m%d")
-
         fetched_total = 0
         by_topic: dict[str, int] = {}
         merged: dict[str, ArxivPaper] = {}
@@ -164,7 +162,7 @@ class ArxivFetcherService:
 
         for category in self.settings.arxiv_categories:
             label = f"cat:{category}"
-            papers = self._fetch_category(category=category, day_token=day_token)
+            papers = self._fetch_category(category=category, target_date=target_date)
             by_topic[label] = len(papers)
             fetched_total += len(papers)
             for paper in papers:
@@ -256,19 +254,33 @@ class ArxivFetcherService:
         except ValueError:
             return None
 
-    def _fetch_category(self, category: str, day_token: str) -> list[ArxivPaper]:
-        query = f"cat:{category} AND submittedDate:[{day_token}0000 TO {day_token}2359]"
-        return self._fetch_by_query(
+    def _fetch_category(self, category: str, target_date: date) -> list[ArxivPaper]:
+        range_start = (target_date - timedelta(days=1)).strftime("%Y%m%d")
+        range_end = (target_date + timedelta(days=1)).strftime("%Y%m%d")
+        query = f"cat:{category} AND submittedDate:[{range_start}0000 TO {range_end}2359]"
+        fetched = self._fetch_by_query(
             query=query,
             matched_label=f"cat:{category}",
+            max_results=max(1, self.settings.arxiv_max_results_per_topic * 3),
         )
+        return [paper for paper in fetched if self._is_target_kst_date(paper, target_date)]
 
-    def _fetch_by_query(self, query: str, matched_label: str) -> list[ArxivPaper]:
+    def _fetch_by_query(
+        self,
+        query: str,
+        matched_label: str,
+        max_results: int | None = None,
+    ) -> list[ArxivPaper]:
+        result_limit = (
+            max(1, max_results)
+            if max_results is not None
+            else max(1, self.settings.arxiv_max_results_per_topic)
+        )
         params = urllib.parse.urlencode(
             {
                 "search_query": query,
                 "start": 0,
-                "max_results": self.settings.arxiv_max_results_per_topic,
+                "max_results": result_limit,
                 "sortBy": "submittedDate",
                 "sortOrder": "descending",
             }
@@ -410,6 +422,28 @@ class ArxivFetcherService:
                 if category in configured_categories
             }
         )
+
+    def _is_target_kst_date(self, paper: ArxivPaper, target_date: date) -> bool:
+        for raw in (paper.published, paper.updated):
+            parsed = self._parse_arxiv_datetime(raw)
+            if parsed is None:
+                continue
+            if parsed.astimezone(KST).date() == target_date:
+                return True
+        return False
+
+    @staticmethod
+    def _parse_arxiv_datetime(raw: str) -> datetime | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed
 
     def _daily_file_path(self, target_date: date) -> Path:
         return self.settings.arxiv_storage_dir / f"{target_date.isoformat()}.json"

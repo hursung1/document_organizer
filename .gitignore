@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment and OS files
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Generated or local input/output data
+results/
+src_docs/

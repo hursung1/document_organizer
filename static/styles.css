@@ -121,6 +121,10 @@ body {
   text-align: left;
 }
 
+.starter-card:disabled {
+  cursor: default;
+}
+
 .starter-card:hover {
   border-color: #99f6e4;
   background: #f0fdfa;
@@ -136,6 +140,19 @@ body {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
+}
+
+.starter-card p.fade-in {
+  animation: starter-summary-fade-in 0.24s ease both;
+}
+
+.starter-card p.streaming {
+  opacity: 0.95;
+}
+
+.starter-token {
+  display: inline;
+  animation: starter-token-fade-in 0.18s ease both;
 }
 
 .chat-panel {
@@ -448,6 +465,26 @@ body {
   }
   50% {
     transform: translateY(-2px);
+    opacity: 1;
+  }
+}
+
+@keyframes starter-summary-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes starter-token-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
     opacity: 1;
   }
 }
