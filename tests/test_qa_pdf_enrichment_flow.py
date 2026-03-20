@@ -103,6 +103,104 @@ class QaPdfEnrichmentFlowTests(unittest.TestCase):
         self.assertIn("Sources:", out)
         self.assertIn("2501.01234", out)
 
+    def test_extract_memory_arxiv_candidates_from_metadata(self) -> None:
+        history = [
+            {
+                "role": "assistant",
+                "text": "이전 답변",
+                "metadata": {
+                    "arxiv_memory": [
+                        {
+                            "arxiv_id": "2501.01234",
+                            "title": "Memory Title",
+                            "pdf_url": "https://arxiv.org/pdf/2501.01234.pdf",
+                            "source_url": "https://arxiv.org/abs/2501.01234",
+                        }
+                    ]
+                },
+            }
+        ]
+        candidates = DocumentQAService._extract_memory_arxiv_candidates(history)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["arxiv_id"], "2501.01234")
+        self.assertEqual(candidates[0]["title"], "Memory Title")
+
+    def test_build_tool_plan_skips_vdb_when_detail_and_memory_exists(self) -> None:
+        service = DocumentQAService.__new__(DocumentQAService)
+        plan = service._build_tool_plan(
+            message="이 논문 원문 기준으로 자세히 설명해줘",
+            memory_candidates=[
+                {
+                    "arxiv_id": "2501.01234",
+                    "title": "T",
+                    "pdf_url": "https://arxiv.org/pdf/2501.01234.pdf",
+                    "source_url": "https://arxiv.org/abs/2501.01234",
+                }
+            ],
+            has_message_arxiv_id=False,
+        )
+        self.assertFalse(plan.use_vdb)
+        self.assertTrue(plan.use_pdf)
+
+
+class QaStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invoke_chat_llm_streams_tokens_for_ainvoke_fallback(self) -> None:
+        class _FakeResponse:
+            content = "alpha beta"
+
+        class _FakeLlm:
+            async def ainvoke(self, _messages):
+                return _FakeResponse()
+
+        service = DocumentQAService.__new__(DocumentQAService)
+        service.chat_llm = _FakeLlm()
+        emitted: list[str] = []
+
+        answer, reasoning = await service._invoke_chat_llm(
+            [("human", "hello")],
+            token_callback=self._collect(emitted),
+        )
+
+        self.assertEqual(answer, "alpha beta")
+        self.assertIsNone(reasoning)
+        self.assertGreater(len(emitted), 1)
+        self.assertEqual("".join(emitted), "alpha beta")
+
+    async def test_invoke_chat_llm_splits_single_stream_chunk(self) -> None:
+        class _Chunk:
+            def __init__(self, text: str) -> None:
+                self.content = text
+                self.additional_kwargs = {}
+                self.response_metadata = {}
+
+        class _FakeLlm:
+            async def astream(self, _messages):
+                yield _Chunk("hello world")
+
+            async def ainvoke(self, _messages):
+                raise AssertionError("ainvoke should not be called when streaming succeeds")
+
+        service = DocumentQAService.__new__(DocumentQAService)
+        service.chat_llm = _FakeLlm()
+        emitted: list[str] = []
+
+        answer, reasoning = await service._invoke_chat_llm(
+            [("human", "hello")],
+            token_callback=self._collect(emitted),
+        )
+
+        self.assertEqual(answer, "hello world")
+        self.assertIsNone(reasoning)
+        self.assertGreater(len(emitted), 1)
+        self.assertEqual("".join(emitted), "hello world")
+
+    @staticmethod
+    def _collect(bucket: list[str]):
+        async def _callback(piece: str) -> None:
+            bucket.append(piece)
+
+        return _callback
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -509,7 +509,7 @@ wheels = [
 
 [[package]]
 name = "glmocr"
-version = "0.1.3"
+version = "0.1.4"
 source = { editable = "glm-ocr" }
 dependencies = [
     { name = "numpy" },
