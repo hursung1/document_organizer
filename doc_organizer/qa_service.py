@@ -34,12 +34,15 @@ ENRICH_TRIGGER_SIGNALS = (
 
 NEW_ID_PATTERN = re.compile(r"\b\d{4}\.\d{4,5}(?:v\d+)?\b")
 OLD_ID_PATTERN = re.compile(r"\b[a-z\-]+(?:\.[A-Z]{2})?/\d{7}(?:v\d+)?\b")
+STREAM_TOKEN_PATTERN = re.compile(r"\S+\s*|\s+")
 
 
 class RAGState(TypedDict, total=False):
     message: str
-    chat_history: list[dict[str, str]]
+    chat_history: list[dict[str, Any]]
     analyzed_query: AnalyzedQuery
+    tool_plan: "ToolPlan"
+    memory_candidates: list[dict[str, str]]
     retrieved: list["RetrievalResult"]
     pdf_evidence: list[PdfEvidence]
     answer: str
@@ -85,7 +88,17 @@ class QAResponse:
 class QAProgressEvent:
     kind: str
     stage: str | None = None
+    token: str | None = None
+    plan: dict[str, Any] | None = None
     response: QAResponse | None = None
+
+
+@dataclass(slots=True)
+class ToolPlan:
+    use_vdb: bool
+    use_pdf: bool
+    reasons: list[str]
+    candidate_arxiv_ids: list[str]
 
 
 class DocumentQAService:
@@ -125,7 +138,7 @@ class DocumentQAService:
                 model=self.settings.qa_model,
                 base_url=self.settings.ollama_host,
                 temperature=0,
-                reasoning=self.settings.ollama_reasoning,
+                reasoning=self.settings.qa_ollama_reasoning,
             )
         if provider == "gemini":
             if not self.settings.gemini_api_key:
@@ -142,6 +155,7 @@ class DocumentQAService:
                 model=self.settings.gemini_model,
                 google_api_key=self.settings.gemini_api_key,
                 temperature=0,
+                streaming=True,
             )
         raise RuntimeError(f"지원하지 않는 LLM_PROVIDER: {self.settings.llm_provider}")
 
@@ -149,7 +163,7 @@ class DocumentQAService:
         self,
         message: str,
         conversation_id: str | None = None,
-        chat_history: list[dict[str, str]] | None = None,
+        chat_history: list[dict[str, Any]] | None = None,
     ) -> QAResponse:
         final_response: QAResponse | None = None
         async for event in self.answer_with_progress(
@@ -172,7 +186,7 @@ class DocumentQAService:
         self,
         message: str,
         conversation_id: str | None = None,
-        chat_history: list[dict[str, str]] | None = None,
+        chat_history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[QAProgressEvent, None]:
         await self._ensure_graph_initialized()
         fallback_analyzed = analyze_user_query(message)
@@ -191,33 +205,83 @@ class DocumentQAService:
         if chat_history:
             state["chat_history"] = chat_history[-8:]
 
-        yield QAProgressEvent(kind="stage", stage="analyze_query")
-        analyze_out = await self._timed_node("analyze_query", self._node_analyze_query)(state)
-        state.update(analyze_out)
+        yield QAProgressEvent(kind="stage", stage="planning")
+        planning_out = await self._timed_node("planning", self._node_planning)(state)
+        state.update(planning_out)
+        plan = state.get("tool_plan") or ToolPlan(
+            use_vdb=True,
+            use_pdf=False,
+            reasons=["planning 결과가 없어 기본 검색 경로를 사용합니다."],
+            candidate_arxiv_ids=[],
+        )
+        yield QAProgressEvent(
+            kind="plan",
+            plan={
+                "use_vdb": plan.use_vdb,
+                "use_pdf": plan.use_pdf,
+                "reasons": plan.reasons,
+                "candidate_arxiv_ids": plan.candidate_arxiv_ids,
+            },
+        )
 
-        yield QAProgressEvent(kind="stage", stage="retrieve_docs")
-        retrieve_out = await self._timed_node("retrieve_docs", self._node_retrieve_docs)(state)
-        state.update(retrieve_out)
+        if plan.use_vdb:
+            yield QAProgressEvent(kind="stage", stage="retrieve_docs")
+            retrieve_out = await self._timed_node("retrieve_docs", self._node_retrieve_docs)(state)
+            state.update(retrieve_out)
+        else:
+            state.update({"retrieved": []})
 
-        yield QAProgressEvent(kind="stage", stage="enrich_with_arxiv_pdf")
-        enrich_out = await self._timed_node(
-            "enrich_with_arxiv_pdf",
-            self._node_enrich_with_arxiv_pdf,
-        )(state)
-        state.update(enrich_out)
+        if plan.use_pdf:
+            yield QAProgressEvent(kind="stage", stage="enrich_with_arxiv_pdf")
+            enrich_out = await self._timed_node(
+                "enrich_with_arxiv_pdf",
+                self._node_enrich_with_arxiv_pdf,
+            )(state)
+            state.update(enrich_out)
+        else:
+            state.update(
+                {
+                    "pdf_evidence": [],
+                    "pdf_enrich_attempted": False,
+                    "pdf_enrich_used": 0,
+                    "pdf_cache_hit_count": 0,
+                    "pdf_download_fail_count": 0,
+                }
+            )
 
         route = self._conditional_edge_doc_base_or_not(state)
         yield QAProgressEvent(kind="stage", stage="generate_answer")
+        token_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        async def _on_token(token: str) -> None:
+            if token:
+                await token_queue.put(token)
+
         if route == "generate_answer_doc_base":
-            generate_out = await self._timed_node(
-                "generate_answer_doc_base",
-                self._node_generate_answer_doc_base,
-            )(state)
+            async def _generate_doc_base(with_state: RAGState) -> RAGState:
+                return await self._node_generate_answer_doc_base(with_state, token_callback=_on_token)
+
+            generate_task = asyncio.create_task(
+                self._timed_node("generate_answer_doc_base", _generate_doc_base)(state)
+            )
         else:
-            generate_out = await self._timed_node(
-                "generate_answer_llm",
-                self._node_generate_answer_llm,
-            )(state)
+            async def _generate_llm(with_state: RAGState) -> RAGState:
+                return await self._node_generate_answer_llm(with_state, token_callback=_on_token)
+
+            generate_task = asyncio.create_task(
+                self._timed_node("generate_answer_llm", _generate_llm)(state)
+            )
+
+        while True:
+            if generate_task.done() and token_queue.empty():
+                break
+            try:
+                token = await asyncio.wait_for(token_queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+            yield QAProgressEvent(kind="token", token=token)
+
+        generate_out = await generate_task
         state.update(generate_out)
 
         analyzed = state.get("analyzed_query") or fallback_analyzed
@@ -373,6 +437,37 @@ class DocumentQAService:
         return str(value).strip()
 
     @staticmethod
+    def _to_stream_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            return "".join(DocumentQAService._to_stream_text(item) for item in value)
+        if isinstance(value, dict):
+            preferred_keys = (
+                "text",
+                "content",
+                "output_text",
+                "message",
+                "final",
+                "answer",
+            )
+            parts: list[str] = []
+            for key in preferred_keys:
+                if key not in value:
+                    continue
+                text = DocumentQAService._to_stream_text(value.get(key))
+                if text:
+                    parts.append(text)
+            if parts:
+                return "".join(parts)
+            return "".join(DocumentQAService._to_stream_text(item) for item in value.values())
+        return str(value)
+
+    @staticmethod
     def _extract_content_list_parts(content: list[Any]) -> tuple[str, str | None]:
         answer_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -477,6 +572,131 @@ class DocumentQAService:
 
         return answer, reasoning
 
+    async def _invoke_chat_llm(
+        self,
+        messages: list[tuple[str, str]],
+        token_callback: Callable[[str], Awaitable[None]] | None = None,
+    ) -> tuple[str, str | None]:
+        if token_callback is None:
+            response = await self.chat_llm.ainvoke(messages)
+            return self._extract_answer_and_reasoning(response)
+
+        async def _emit_stream_tokens(text: str) -> int:
+            emitted_count = 0
+            for piece in self._split_stream_tokens(text):
+                if not piece:
+                    continue
+                await token_callback(piece)
+                emitted_count += 1
+                await asyncio.sleep(0)
+            return emitted_count
+
+        astream = getattr(self.chat_llm, "astream", None)
+        if callable(astream):
+            emitted_text = ""
+            answer_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            emitted_token_count = 0
+            async for chunk in astream(messages):
+                piece, reasoning_piece = self._extract_stream_chunk_piece(
+                    chunk,
+                    emitted_prefix=emitted_text,
+                )
+                if piece:
+                    emitted_text += piece
+                    answer_parts.append(piece)
+                    emitted_token_count += await _emit_stream_tokens(piece)
+                if reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+            answer = "".join(answer_parts).strip()
+            reasoning = "\n".join(part for part in reasoning_parts if part).strip() or None
+            if answer:
+                logger.info(
+                    "qa_stream_emit_summary mode=astream token_chunks=%d answer_len=%d",
+                    emitted_token_count,
+                    len(answer),
+                )
+                return answer, reasoning
+
+        response = await self.chat_llm.ainvoke(messages)
+        answer, reasoning = self._extract_answer_and_reasoning(response)
+        if answer:
+            emitted = await _emit_stream_tokens(answer)
+            logger.info(
+                "qa_stream_emit_summary mode=ainvoke_fallback token_chunks=%d answer_len=%d",
+                emitted,
+                len(answer),
+            )
+        return answer, reasoning
+
+    @classmethod
+    def _split_stream_tokens(cls, text: str) -> list[str]:
+        if not text:
+            return []
+        return STREAM_TOKEN_PATTERN.findall(text)
+
+    @classmethod
+    def _extract_stream_chunk_piece(
+        cls,
+        chunk: Any,
+        *,
+        emitted_prefix: str,
+    ) -> tuple[str, str]:
+        visible_raw = ""
+        text_accessor = getattr(chunk, "text", None)
+        if text_accessor is not None and not callable(text_accessor):
+            try:
+                visible_raw = str(text_accessor)
+            except Exception:
+                visible_raw = ""
+
+        content = getattr(chunk, "content", "")
+        if isinstance(content, str):
+            if not visible_raw:
+                visible_raw = content
+            reasoning_raw = ""
+        elif isinstance(content, list):
+            visible_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = str(item.get("type", "")).strip().lower()
+                    if item_type in {"reasoning", "thinking", "reasoning_content", "thought", "analysis"}:
+                        text = cls._to_stream_text(item.get("text") or item.get("content") or item)
+                        if text:
+                            reasoning_parts.append(text)
+                        continue
+                    text = cls._to_stream_text(item.get("text") or item.get("content") or item)
+                    if text:
+                        visible_parts.append(text)
+                    continue
+                text = cls._to_stream_text(item)
+                if text:
+                    visible_parts.append(text)
+            if not visible_raw:
+                visible_raw = "".join(visible_parts)
+            reasoning_raw = "\n".join(reasoning_parts)
+        else:
+            if not visible_raw:
+                visible_raw = cls._to_stream_text(content)
+            reasoning_raw = ""
+
+        for container_name in ("additional_kwargs", "response_metadata"):
+            container = getattr(chunk, container_name, None)
+            if not isinstance(container, dict):
+                continue
+            for key in ("reasoning_content", "thinking", "reasoning", "thought", "think"):
+                text = cls._to_stream_text(container.get(key))
+                if text:
+                    reasoning_raw = f"{reasoning_raw}\n{text}".strip()
+
+        visible = visible_raw or ""
+        if visible.startswith(emitted_prefix):
+            delta = visible[len(emitted_prefix):]
+        else:
+            delta = visible
+        return delta, reasoning_raw.strip()
+
     async def _ensure_graph_initialized(self) -> None:
         if self._graph is not None:
             return
@@ -491,8 +711,8 @@ class DocumentQAService:
 
         workflow = StateGraph(RAGState)
         workflow.add_node(
-            "analyze_query",
-            self._timed_node("analyze_query", self._node_analyze_query),
+            "planning",
+            self._timed_node("planning", self._node_planning),
         )
         workflow.add_node(
             "retrieve_docs",
@@ -510,8 +730,8 @@ class DocumentQAService:
             "generate_answer_llm",
             self._timed_node("generate_answer_llm", self._node_generate_answer_llm),
         )
-        workflow.add_edge(START, "analyze_query")
-        workflow.add_edge("analyze_query", "retrieve_docs")
+        workflow.add_edge(START, "planning")
+        workflow.add_edge("planning", "retrieve_docs")
         workflow.add_edge("retrieve_docs", "enrich_with_arxiv_pdf")
         workflow.add_conditional_edges(
             "enrich_with_arxiv_pdf",
@@ -617,6 +837,14 @@ class DocumentQAService:
         if analyzed:
             summary["search_query"] = analyzed.search_query[:200]
             summary["keywords"] = analyzed.keywords[:8]
+        tool_plan = result.get("tool_plan")
+        if tool_plan:
+            summary["tool_plan"] = {
+                "use_vdb": bool(tool_plan.use_vdb),
+                "use_pdf": bool(tool_plan.use_pdf),
+                "reasons": tool_plan.reasons[:4],
+                "candidate_arxiv_ids": tool_plan.candidate_arxiv_ids[:6],
+            }
         if "retrieved" in result:
             retrieved = result.get("retrieved") or []
             summary["retrieved_count"] = len(retrieved)
@@ -662,7 +890,7 @@ class DocumentQAService:
         )
         return str(response.content or "").strip()
 
-    async def _node_analyze_query(self, state: RAGState) -> RAGState:
+    async def _node_planning(self, state: RAGState) -> RAGState:
         message = (state.get("message") or "").strip()
         chat_history = state.get("chat_history") or []
         chat_history_text = self._history_to_text(chat_history)
@@ -670,20 +898,169 @@ class DocumentQAService:
         if not fallback.normalized:
             return {
                 "analyzed_query": fallback,
+                "tool_plan": ToolPlan(
+                    use_vdb=False,
+                    use_pdf=False,
+                    reasons=["질문이 비어 있어 tool 실행을 생략합니다."],
+                    candidate_arxiv_ids=[],
+                ),
                 "error": "질문이 비어 있습니다.",
             }
+
+        memory_candidates = self._extract_memory_arxiv_candidates(chat_history)
+        message_arxiv_id = self._extract_arxiv_id(message)
+        if message_arxiv_id and not any(
+            candidate.get("arxiv_id", "") == message_arxiv_id
+            for candidate in memory_candidates
+        ):
+            memory_candidates.insert(
+                0,
+                {
+                    "arxiv_id": message_arxiv_id,
+                    "title": "",
+                    "pdf_url": self._build_pdf_url(message_arxiv_id),
+                    "source_url": f"https://arxiv.org/abs/{message_arxiv_id}",
+                },
+            )
+
+        plan = self._build_tool_plan(
+            message=message,
+            memory_candidates=memory_candidates,
+            has_message_arxiv_id=bool(message_arxiv_id),
+        )
         try:
             llm_text = await self._invoke_json_analysis(
                 message,
                 chat_history_text=chat_history_text,
             )
             analyzed = parse_llm_analysis(message, llm_text)
-            return {"analyzed_query": analyzed}
+            return {
+                "analyzed_query": analyzed,
+                "tool_plan": plan,
+                "memory_candidates": memory_candidates,
+            }
         except Exception as exc:
             return {
                 "analyzed_query": fallback,
+                "tool_plan": plan,
+                "memory_candidates": memory_candidates,
                 "error": f"질의 분석 LLM 오류: {exc}",
             }
+
+    async def _node_analyze_query(self, state: RAGState) -> RAGState:
+        return await self._node_planning(state)
+
+    def _build_tool_plan(
+        self,
+        message: str,
+        memory_candidates: list[dict[str, str]],
+        has_message_arxiv_id: bool,
+    ) -> ToolPlan:
+        reasons: list[str] = []
+        detail_question = self._is_detail_question(message)
+        has_memory_candidates = bool(memory_candidates)
+
+        use_vdb = True
+        use_pdf = False
+
+        if detail_question:
+            use_pdf = True
+            reasons.append("질문이 원문/상세형이어서 PDF enrichment를 사용합니다.")
+        if has_message_arxiv_id:
+            use_pdf = True
+            reasons.append("질문에 arXiv ID가 명시되어 PDF enrichment를 사용합니다.")
+
+        if use_pdf and has_memory_candidates:
+            use_vdb = False
+            reasons.append("대화 메모리에서 arXiv 후보를 확보해 VDB 검색을 생략합니다.")
+        elif use_pdf:
+            use_vdb = True
+            reasons.append("PDF 후보 arXiv ID 확보를 위해 VDB 검색을 선행합니다.")
+        else:
+            reasons.append("기본 문서 근거 확보를 위해 VDB 검색을 사용합니다.")
+
+        candidate_arxiv_ids = [
+            candidate.get("arxiv_id", "").strip()
+            for candidate in memory_candidates
+            if candidate.get("arxiv_id", "").strip()
+        ]
+        return ToolPlan(
+            use_vdb=use_vdb,
+            use_pdf=use_pdf,
+            reasons=reasons,
+            candidate_arxiv_ids=candidate_arxiv_ids,
+        )
+
+    @classmethod
+    def _extract_memory_arxiv_candidates(
+        cls,
+        chat_history: list[dict[str, Any]],
+        limit: int = 20,
+    ) -> list[dict[str, str]]:
+        candidates: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        for turn in reversed(chat_history):
+            if len(candidates) >= limit:
+                break
+            metadata = turn.get("metadata")
+            if isinstance(metadata, dict):
+                memory_items = metadata.get("arxiv_memory")
+                if isinstance(memory_items, list):
+                    for item in memory_items:
+                        if not isinstance(item, dict):
+                            continue
+                        arxiv_id = str(item.get("arxiv_id", "")).strip()
+                        if not arxiv_id or arxiv_id in seen:
+                            continue
+                        seen.add(arxiv_id)
+                        candidates.append(
+                            {
+                                "arxiv_id": arxiv_id,
+                                "title": str(item.get("title", "")).strip(),
+                                "pdf_url": str(item.get("pdf_url", "")).strip(),
+                                "source_url": str(item.get("source_url", "")).strip(),
+                            }
+                        )
+                        if len(candidates) >= limit:
+                            break
+            if len(candidates) >= limit:
+                break
+
+            text = str(turn.get("text", "")).strip()
+            if not text:
+                continue
+            for arxiv_id in cls._extract_arxiv_ids_from_text(text):
+                if arxiv_id in seen:
+                    continue
+                seen.add(arxiv_id)
+                candidates.append(
+                    {
+                        "arxiv_id": arxiv_id,
+                        "title": "",
+                        "pdf_url": cls._build_pdf_url(arxiv_id),
+                        "source_url": f"https://arxiv.org/abs/{arxiv_id}",
+                    }
+                )
+                if len(candidates) >= limit:
+                    break
+        return candidates
+
+    @classmethod
+    def _extract_arxiv_ids_from_text(cls, text: str) -> list[str]:
+        raw = (text or "").strip()
+        if not raw:
+            return []
+        found: list[str] = []
+        seen: set[str] = set()
+        for pattern in (NEW_ID_PATTERN, OLD_ID_PATTERN):
+            for match in pattern.findall(raw):
+                normalized = str(match).strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                found.append(normalized)
+        return found
 
     @staticmethod
     def _safe_parse_metadata(raw: Any) -> dict[str, Any]:
@@ -818,11 +1195,11 @@ class DocumentQAService:
         retrieved = state.get("retrieved") or []
         message = str(state.get("message") or "")
         analyzed = state.get("analyzed_query")
-        detail_question = self._is_detail_question(message)
-        retrieved_for_enrich = self._augment_retrieval_with_message_arxiv_id(
+        memory_candidates = state.get("memory_candidates") or []
+        retrieved_for_enrich = self._build_retrieval_for_pdf_enrichment(
             retrieved=retrieved,
             message=message,
-            only_when_detail=detail_question,
+            memory_candidates=memory_candidates,
         )
 
         if not self.settings.arxiv_pdf_enrich_enabled:
@@ -835,14 +1212,7 @@ class DocumentQAService:
             }
         if not analyzed:
             return {"pdf_evidence": [], "pdf_enrich_attempted": False, "pdf_enrich_used": 0}
-
-        should_enrich = self._needs_pdf_enrichment(
-            message=message,
-            retrieved=retrieved_for_enrich,
-            top_k=self.settings.retrieval_top_k,
-            min_score=self.settings.arxiv_pdf_min_score,
-        )
-        if not should_enrich:
+        if not retrieved_for_enrich:
             return {
                 "pdf_evidence": [],
                 "pdf_enrich_attempted": False,
@@ -874,32 +1244,58 @@ class DocumentQAService:
                 "pdf_enrich_error": str(exc),
             }
 
-    def _augment_retrieval_with_message_arxiv_id(
+    def _build_retrieval_for_pdf_enrichment(
         self,
         retrieved: list[RetrievalResult],
         message: str,
-        only_when_detail: bool,
+        memory_candidates: list[dict[str, str]],
     ) -> list[RetrievalResult]:
-        if not only_when_detail:
-            return retrieved
-        arxiv_id = self._extract_arxiv_id(message)
-        if not arxiv_id:
-            return retrieved
-        if any((item.arxiv_id or "").strip() == arxiv_id for item in retrieved):
-            return retrieved
+        combined: list[RetrievalResult] = list(retrieved)
+        seen_ids = {
+            (item.arxiv_id or "").strip()
+            for item in combined
+            if (item.arxiv_id or "").strip()
+        }
 
-        synthetic = RetrievalResult(
-            id=f"message:{arxiv_id}",
-            score=1.0,
-            source=f"arXiv:{arxiv_id}",
-            chunk_id=0,
-            text="",
-            arxiv_id=arxiv_id,
-            pdf_url=self._build_pdf_url(arxiv_id),
-            source_url=f"https://arxiv.org/abs/{arxiv_id}",
-            metadata={"arxiv_id": arxiv_id},
-        )
-        return [synthetic, *retrieved]
+        message_arxiv_id = self._extract_arxiv_id(message)
+        if message_arxiv_id and message_arxiv_id not in seen_ids:
+            seen_ids.add(message_arxiv_id)
+            combined.insert(
+                0,
+                RetrievalResult(
+                    id=f"message:{message_arxiv_id}",
+                    score=1.0,
+                    source=f"arXiv:{message_arxiv_id}",
+                    chunk_id=0,
+                    text="",
+                    arxiv_id=message_arxiv_id,
+                    pdf_url=self._build_pdf_url(message_arxiv_id),
+                    source_url=f"https://arxiv.org/abs/{message_arxiv_id}",
+                    metadata={"arxiv_id": message_arxiv_id},
+                ),
+            )
+
+        for candidate in memory_candidates:
+            arxiv_id = str(candidate.get("arxiv_id", "")).strip()
+            if not arxiv_id or arxiv_id in seen_ids:
+                continue
+            seen_ids.add(arxiv_id)
+            title = str(candidate.get("title", "")).strip()
+            summary_text = f"Title: {title}" if title else ""
+            combined.append(
+                RetrievalResult(
+                    id=f"memory:{arxiv_id}",
+                    score=0.95,
+                    source=f"arXiv:{arxiv_id}",
+                    chunk_id=0,
+                    text=summary_text,
+                    arxiv_id=arxiv_id,
+                    pdf_url=str(candidate.get("pdf_url", "")).strip() or self._build_pdf_url(arxiv_id),
+                    source_url=str(candidate.get("source_url", "")).strip() or f"https://arxiv.org/abs/{arxiv_id}",
+                    metadata={"arxiv_id": arxiv_id, "title": title},
+                )
+            )
+        return combined
 
     def _fallback_retrieve_from_arxiv_files(
         self,
@@ -979,7 +1375,11 @@ class DocumentQAService:
     def _tokenize(text: str) -> set[str]:
         return set(re.findall(r"[A-Za-z0-9가-힣]{2,}", text.lower()))
 
-    async def _node_generate_answer_doc_base(self, state: RAGState) -> RAGState:
+    async def _node_generate_answer_doc_base(
+        self,
+        state: RAGState,
+        token_callback: Callable[[str], Awaitable[None]] | None = None,
+    ) -> RAGState:
         user_message = (state.get("message") or "").strip()
         chat_history = state.get("chat_history") or []
         chat_history_text = self._history_to_text(chat_history)
@@ -1046,13 +1446,13 @@ class DocumentQAService:
             "한국어로 간결하고 정확하게 답변해라."
         )
         try:
-            response = await self.chat_llm.ainvoke(
+            answer, reasoning = await self._invoke_chat_llm(
                 [
                     ("system", system_prompt),
                     ("human", user_prompt),
-                ]
+                ],
+                token_callback=token_callback,
             )
-            answer, reasoning = self._extract_answer_and_reasoning(response)
             if not answer:
                 raise RuntimeError("Empty response from LLM.")
             cited_indexes = self._extract_cited_context_indexes(answer)
@@ -1096,7 +1496,11 @@ class DocumentQAService:
                 )
             return {"answer": self._append_source_lines(answer, cited_source_lines)}
 
-    async def _node_generate_answer_llm(self, state: RAGState) -> RAGState:
+    async def _node_generate_answer_llm(
+        self,
+        state: RAGState,
+        token_callback: Callable[[str], Awaitable[None]] | None = None,
+    ) -> RAGState:
         user_message = state.get("message")
         chat_history = state.get("chat_history") or []
         chat_history_text = self._history_to_text(chat_history)
@@ -1111,13 +1515,13 @@ class DocumentQAService:
             "한국어로 간결하고 정확하게 답변해라."
         )
         try:
-            response = await self.chat_llm.ainvoke(
+            answer, reasoning = await self._invoke_chat_llm(
                 [
                     ("system", system_prompt),
                     ("human", user_prompt),
-                ]
+                ],
+                token_callback=token_callback,
             )
-            answer, reasoning = self._extract_answer_and_reasoning(response)
             if not answer:
                 raise RuntimeError("Empty response from LLM.")
             result: RAGState = {"answer": self._append_source_lines(answer, [])}
@@ -1230,7 +1634,7 @@ class DocumentQAService:
         return "\n".join(lines)
 
     @staticmethod
-    def _history_to_text(chat_history: list[dict[str, str]]) -> str:
+    def _history_to_text(chat_history: list[dict[str, Any]]) -> str:
         if not chat_history:
             return "(없음)"
         lines: list[str] = []

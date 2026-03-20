@@ -55,6 +55,7 @@ starter_summary_llm_initialized = False
 ARXIV_MANUAL_LOOKBACK_DAYS_DEFAULT = 10
 STARTER_SUMMARY_SENTENCE_COUNT = 3
 STARTER_SUMMARY_MAX_CHARS = 1200
+STARTER_SUMMARY_OUTPUT_MAX_CHARS = 280
 STARTER_SUMMARY_FIRST_TOKEN_TIMEOUT_SEC = 15.0
 STARTER_SUMMARY_STREAM_IDLE_TIMEOUT_SEC = 20.0
 STARTER_SUMMARY_SYNC_TIMEOUT_SEC = 20.0
@@ -112,6 +113,7 @@ class ConversationMessage(BaseModel):
     role: str
     text: str
     reasoning: str | None = None
+    metadata: dict[str, Any] | None = None
     created_at: str
 
 
@@ -123,7 +125,7 @@ class ConversationMessagesResponse(BaseModel):
 CHAT_KEY_PREFIX = "doc_organizer:chat"
 CHAT_INDEX_KEY = f"{CHAT_KEY_PREFIX}:index"
 STAGE_LABELS = {
-    "analyze_query": "질의 분석 중",
+    "planning": "도구 실행 계획 수립 중",
     "retrieve_docs": "문서 검색 중",
     "enrich_with_arxiv_pdf": "arXiv 원문 보강 중",
     "generate_answer": "답변 생성 중",
@@ -227,12 +229,14 @@ async def _append_message(
     role: str,
     text: str,
     reasoning: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     client = await _resolve_redis_client()
     payload = {
         "role": role,
         "text": text,
         "reasoning": reasoning,
+        "metadata": metadata,
         "created_at": _utc_now_iso(),
     }
     await client.rpush(_chat_messages_key(conversation_id), json.dumps(payload, ensure_ascii=False))
@@ -279,6 +283,7 @@ async def _get_conversation_messages(conversation_id: str) -> list[ConversationM
                     if item.get("reasoning") is not None
                     else None
                 ),
+                metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else None,
                 created_at=str(item.get("created_at", _utc_now_iso())),
             )
         )
@@ -297,6 +302,74 @@ async def _delete_conversation(conversation_id: str) -> bool:
 
 def _normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_title_from_retrieval_text(text: str) -> str:
+    raw = str(text or "")
+    match = re.search(r"(?im)^title:\s*(.+)$", raw)
+    if match:
+        return _normalize_space(match.group(1))
+    first = _split_sentences(raw)
+    if first:
+        return _normalize_space(first[0])[:200]
+    return ""
+
+
+def _build_arxiv_memory_items(
+    retrieved: list[Any],
+    *,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    now_iso = _utc_now_iso()
+
+    for item in retrieved:
+        arxiv_id = _normalize_space(str(getattr(item, "arxiv_id", "") or ""))
+        if not arxiv_id and isinstance(item, dict):
+            arxiv_id = _normalize_space(str(item.get("arxiv_id", "") or ""))
+        if not arxiv_id or arxiv_id in seen:
+            continue
+        seen.add(arxiv_id)
+
+        text = (
+            str(getattr(item, "text", "") or "")
+            if not isinstance(item, dict)
+            else str(item.get("text", "") or "")
+        )
+        title = _extract_title_from_retrieval_text(text)
+        if not title:
+            title = f"arXiv:{arxiv_id}"
+
+        pdf_url = (
+            str(getattr(item, "pdf_url", "") or "")
+            if not isinstance(item, dict)
+            else str(item.get("pdf_url", "") or "")
+        )
+        source_url = (
+            str(getattr(item, "source_url", "") or "")
+            if not isinstance(item, dict)
+            else str(item.get("source_url", "") or "")
+        )
+        score_raw = getattr(item, "score", None) if not isinstance(item, dict) else item.get("score")
+        try:
+            score = float(score_raw or 0.0)
+        except Exception:
+            score = 0.0
+
+        out.append(
+            {
+                "arxiv_id": arxiv_id,
+                "title": title,
+                "pdf_url": pdf_url,
+                "source_url": source_url,
+                "score": score,
+                "captured_at": now_iso,
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _strip_html(text: str) -> str:
@@ -390,17 +463,11 @@ def _pick_summary_sentences(text: str, limit: int = STARTER_SUMMARY_SENTENCE_COU
 
 
 def _fallback_starter_summary(title: str, summary: str) -> str:
-    base = _pick_summary_sentences(summary, STARTER_SUMMARY_SENTENCE_COUNT)
-    generic = [
-        f"{_normalize_space(title) or '이 논문'}은 핵심 문제와 해결 아이디어를 간결하게 제시한다.",
-        "핵심 방법과 실험 결과를 함께 보면 성능의 근거를 빠르게 파악할 수 있다.",
-        "실제 적용 가능성은 데이터 조건과 계산 비용을 함께 검토해 판단하는 것이 좋다.",
-    ]
-    for sentence in generic:
-        if len(base) >= STARTER_SUMMARY_SENTENCE_COUNT:
-            break
-        base.append(_ensure_sentence_end(sentence))
-    return " ".join(base[:STARTER_SUMMARY_SENTENCE_COUNT])
+    base = _pick_summary_sentences(summary, limit=2)
+    if base:
+        return _trim_summary_length(" ".join(base))
+    generic = f"{_normalize_space(title) or '이 논문'}의 핵심 아이디어와 결과를 간결하게 요약한 내용이다."
+    return _trim_summary_length(_ensure_sentence_end(generic))
 
 
 def _build_starter_chat_llm() -> Any | None:
@@ -411,10 +478,10 @@ def _build_starter_chat_llm() -> Any | None:
         except Exception:
             return None
         return ChatOllama(
-            model=settings.qa_model,
+            model=settings.starter_summary_model,
             base_url=settings.ollama_host,
             temperature=0,
-            reasoning=settings.ollama_reasoning,
+            reasoning=settings.starter_ollama_reasoning,
         )
     if provider == "gemini":
         if not settings.gemini_api_key:
@@ -431,6 +498,13 @@ def _build_starter_chat_llm() -> Any | None:
     return None
 
 
+def _starter_summary_model_name(provider: str | None = None) -> str:
+    current_provider = (provider or settings.llm_provider or "").strip().lower()
+    if current_provider == "ollama":
+        return settings.starter_summary_model
+    return settings.gemini_model
+
+
 def _resolve_starter_chat_llm() -> Any | None:
     global starter_summary_llm
     global starter_summary_llm_initialized
@@ -441,7 +515,7 @@ def _resolve_starter_chat_llm() -> Any | None:
     logger.info(
         "starter_summary_llm_initialized provider=%s model=%s ollama_host=%s has_client=%s",
         (settings.llm_provider or "").strip().lower(),
-        (settings.qa_model if (settings.llm_provider or "").strip().lower() == "ollama" else settings.gemini_model),
+        _starter_summary_model_name(),
         settings.ollama_host,
         bool(starter_summary_llm),
     )
@@ -467,26 +541,41 @@ async def _invoke_with_timeout(
 
 def _starter_summary_prompts(title: str, source_text: str) -> tuple[str, str]:
     system_prompt = (
-        "너는 논문 요약 편집자다. 입력된 summary를 한국어 자연문 3문장으로 다시 요약해라.\n"
+        "너는 논문 요약 편집자다. 입력된 summary를 한국어로 자연스럽고 간결하게 다시 요약해라.\n"
         "규칙:\n"
-        "1) 정확히 3문장\n"
-        "2) 각 문장 20~55자 내외\n"
-        "3) 불릿/번호/마크다운 금지\n"
-        "4) 논문 제목을 반복하지 말고 핵심 문제, 방법, 결과를 담을 것"
+        "1) 너무 짧지도 길지도 않게 핵심만 요약할 것(대략 80~220자)\n"
+        "2) 불릿/번호/마크다운 없이 일반 문장으로만 작성할 것\n"
+        "3) 논문 제목을 반복하지 말고 핵심 문제, 방법, 결과를 중심으로 쓸 것\n"
+        "4) 원문에 없는 사실을 추가하지 말 것"
     )
     user_prompt = (
         f"논문 제목:\n{title}\n\n"
         f"원본 summary:\n{source_text}\n\n"
-        "한국어 3문장 요약:"
+        "한국어 요약:"
     )
     return system_prompt, user_prompt
 
 
+def _trim_summary_length(text: str, max_chars: int = STARTER_SUMMARY_OUTPUT_MAX_CHARS) -> str:
+    cleaned = _normalize_space(text)
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_chars:
+        return cleaned
+    clipped = cleaned[:max_chars].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return _ensure_sentence_end(clipped)
+
+
 def _finalize_streamed_summary(generated_text: str) -> str | None:
-    candidates = _pick_summary_sentences(generated_text, STARTER_SUMMARY_SENTENCE_COUNT)
-    if len(candidates) < STARTER_SUMMARY_SENTENCE_COUNT:
+    normalized = _normalize_space(generated_text)
+    if not normalized:
         return None
-    return " ".join(candidates[:STARTER_SUMMARY_SENTENCE_COUNT])
+    candidates = _pick_summary_sentences(normalized, STARTER_SUMMARY_SENTENCE_COUNT)
+    if candidates:
+        return _trim_summary_length(" ".join(candidates))
+    return _trim_summary_length(normalized)
 
 
 def _split_stream_tokens(text: str) -> list[str]:
@@ -503,7 +592,7 @@ def _coerce_visible_stream_content(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value.strip()
+        return value
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
@@ -514,12 +603,24 @@ def _coerce_visible_stream_content(value: Any) -> str:
             text = _coerce_visible_stream_content(item)
             if text:
                 parts.append(text)
-        return "\n".join(parts).strip()
+        return "".join(parts)
     if isinstance(value, dict):
         item_type = _normalize_space(str(value.get("type", ""))).lower()
         if item_type in _REASONING_BLOCK_TYPES:
             return ""
-    return _coerce_llm_content(value)
+        preferred_keys = ("text", "content", "summary", "output_text", "message", "answer")
+        parts: list[str] = []
+        for key in preferred_keys:
+            if key not in value:
+                continue
+            text = _coerce_visible_stream_content(value.get(key))
+            if text:
+                parts.append(text)
+        if parts:
+            return "".join(parts)
+        nested = [_coerce_visible_stream_content(item) for item in value.values()]
+        return "".join([part for part in nested if part])
+    return str(value)
 
 
 def _has_reasoning_marker(value: Any) -> bool:
@@ -638,7 +739,7 @@ async def _summarize_arxiv_summary(doc_id: str, title: str, summary: str) -> str
 
     started = time.perf_counter()
     provider = (settings.llm_provider or "").strip().lower() or "unknown"
-    model_name = settings.qa_model if provider == "ollama" else settings.gemini_model
+    model_name = _starter_summary_model_name(provider)
     logger.info(
         "starter_summary_llm_call_start doc_id=%s provider=%s model=%s source_chars=%d",
         doc_id[:120],
@@ -705,8 +806,8 @@ async def _generate_starter_summary(
         return _fallback_starter_summary(title=clean_title, summary=clean_summary)
 
     picked = _pick_summary_sentences(base_text, STARTER_SUMMARY_SENTENCE_COUNT)
-    if len(picked) >= STARTER_SUMMARY_SENTENCE_COUNT:
-        return " ".join(picked[:STARTER_SUMMARY_SENTENCE_COUNT])
+    if picked:
+        return _trim_summary_length(" ".join(picked))
     return _fallback_starter_summary(title=clean_title, summary=base_text)
 
 
@@ -723,7 +824,7 @@ async def _stream_arxiv_starter_summary_events(
 
     llm = _resolve_starter_chat_llm()
     provider = (settings.llm_provider or "").strip().lower() or "unknown"
-    model_name = settings.qa_model if provider == "ollama" else settings.gemini_model
+    model_name = _starter_summary_model_name(provider)
     if llm is None or not source_text:
         logger.warning(
             "starter_summary_stream_unavailable doc_id=%s provider=%s model=%s has_client=%s",
@@ -797,7 +898,18 @@ async def _stream_arxiv_starter_summary_events(
                 yield _sse_event("done", {"id": clean_id})
                 return
 
-            raise ValueError("summary output does not contain 3 valid sentences")
+            raise ValueError("summary output is empty")
+        except asyncio.CancelledError:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "starter_summary_stream_call_cancelled doc_id=%s provider=%s model=%s attempt=%d elapsed_ms=%d",
+                clean_id[:120],
+                provider,
+                model_name,
+                attempt,
+                elapsed_ms,
+            )
+            return
         except Exception as exc:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             logger.warning(
@@ -1122,7 +1234,9 @@ async def health() -> dict[str, Any]:
         "arxiv_collection": settings.arxiv_collection_name,
         "llm_provider": settings.llm_provider,
         "qa_model": settings.qa_model,
-        "ollama_reasoning": settings.ollama_reasoning,
+        "starter_summary_model": settings.starter_summary_model,
+        "qa_ollama_reasoning": settings.qa_ollama_reasoning,
+        "starter_ollama_reasoning": settings.starter_ollama_reasoning,
         "starter_summary_first_token_timeout_sec": STARTER_SUMMARY_FIRST_TOKEN_TIMEOUT_SEC,
         "starter_summary_stream_idle_timeout_sec": STARTER_SUMMARY_STREAM_IDLE_TIMEOUT_SEC,
         "starter_summary_sync_timeout_sec": STARTER_SUMMARY_SYNC_TIMEOUT_SEC,
@@ -1193,27 +1307,31 @@ async def starter_doc_summary_stream(payload: StarterSummaryRequest) -> Streamin
     clean_source = _normalize_space(payload.summary_source or "").lower()
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        if clean_source != "arxiv":
-            yield _sse_event("start", {"id": clean_id, "attempt": 1})
-            generated = await _generate_starter_summary(
+        try:
+            if clean_source != "arxiv":
+                yield _sse_event("start", {"id": clean_id, "attempt": 1})
+                generated = await _generate_starter_summary(
+                    doc_id=clean_id,
+                    title=clean_title,
+                    summary=clean_summary,
+                    raw_summary=clean_raw_summary,
+                    summary_source=clean_source,
+                )
+                for piece in _split_stream_tokens(generated):
+                    yield _sse_event("token", {"id": clean_id, "token": piece})
+                yield _sse_event("complete", {"id": clean_id, "summary": generated})
+                yield _sse_event("done", {"id": clean_id})
+                return
+
+            async for event in _stream_arxiv_starter_summary_events(
                 doc_id=clean_id,
                 title=clean_title,
-                summary=clean_summary,
-                raw_summary=clean_raw_summary,
-                summary_source=clean_source,
-            )
-            for piece in _split_stream_tokens(generated):
-                yield _sse_event("token", {"id": clean_id, "token": piece})
-            yield _sse_event("complete", {"id": clean_id, "summary": generated})
-            yield _sse_event("done", {"id": clean_id})
+                summary=clean_raw_summary or clean_summary,
+            ):
+                yield event
+        except asyncio.CancelledError:
+            logger.info("starter_summary_stream_disconnected doc_id=%s", clean_id[:120])
             return
-
-        async for event in _stream_arxiv_starter_summary_events(
-            doc_id=clean_id,
-            title=clean_title,
-            summary=clean_raw_summary or clean_summary,
-        ):
-            yield event
 
     return StreamingResponse(
         event_stream(),
@@ -1267,7 +1385,11 @@ async def chat(payload: ChatRequest) -> ChatResponse:
         await _append_message(conversation_id, role="user", text=message)
         history_messages = await _get_conversation_messages(conversation_id)
         history_payload = [
-            {"role": item.role, "text": item.text}
+            {
+                "role": item.role,
+                "text": item.text,
+                "metadata": item.metadata,
+            }
             for item in history_messages
         ]
         qa = _resolve_qa_service()
@@ -1285,11 +1407,13 @@ async def chat(payload: ChatRequest) -> ChatResponse:
             answer=answer,
             limit=2,
         )
+        arxiv_memory_items = _build_arxiv_memory_items(rag_result.retrieved)
         await _append_message(
             conversation_id,
             role="assistant",
             text=answer,
             reasoning=reasoning,
+            metadata={"arxiv_memory": arxiv_memory_items} if arxiv_memory_items else None,
         )
     except Exception as exc:
         runtime_state["last_qa_error"] = str(exc)
@@ -1315,11 +1439,19 @@ async def chat_stream(payload: ChatRequest) -> StreamingResponse:
             qa = _resolve_qa_service()
             await _append_message(conversation_id, role="user", text=message)
             history_messages = await _get_conversation_messages(conversation_id)
-            history_payload = [{"role": item.role, "text": item.text} for item in history_messages]
+            history_payload = [
+                {
+                    "role": item.role,
+                    "text": item.text,
+                    "metadata": item.metadata,
+                }
+                for item in history_messages
+            ]
 
             final_answer: str | None = None
             final_reasoning: str | None = None
             final_suggested_questions: list[str] = []
+            final_arxiv_memory: list[dict[str, Any]] = []
             async for progress in qa.answer_with_progress(
                 message=message,
                 conversation_id=conversation_id,
@@ -1331,6 +1463,16 @@ async def chat_stream(payload: ChatRequest) -> StreamingResponse:
                     yield _sse_event("stage", {"stage": stage, "label": label})
                     continue
 
+                if progress.kind == "token":
+                    token = (progress.token or "")
+                    if token:
+                        yield _sse_event("token", {"token": token})
+                    continue
+
+                if progress.kind == "plan" and progress.plan is not None:
+                    yield _sse_event("plan", progress.plan)
+                    continue
+
                 if progress.kind == "final" and progress.response is not None:
                     final_answer = progress.response.answer
                     final_reasoning = progress.response.reasoning
@@ -1340,11 +1482,13 @@ async def chat_stream(payload: ChatRequest) -> StreamingResponse:
                         answer=final_answer,
                         limit=2,
                     )
+                    final_arxiv_memory = _build_arxiv_memory_items(progress.response.retrieved)
                     await _append_message(
                         conversation_id,
                         role="assistant",
                         text=final_answer,
                         reasoning=final_reasoning,
+                        metadata={"arxiv_memory": final_arxiv_memory} if final_arxiv_memory else None,
                     )
                     runtime_state["last_qa_error"] = None
                     yield _sse_event(

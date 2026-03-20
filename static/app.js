@@ -33,7 +33,7 @@ let starterSummaryRequestVersion = 0;
 const STARTER_SUMMARY_MAX_CONCURRENCY = 2;
 const starterSummaryAbortControllers = new Set();
 const STAGE_LABELS = {
-  analyze_query: "질의 분석 중",
+  planning: "도구 실행 계획 수립 중",
   retrieve_docs: "문서 검색 중",
   enrich_with_arxiv_pdf: "arXiv 원문 보강 중",
   generate_answer: "답변 생성 중",
@@ -207,6 +207,7 @@ function appendProgressBubble(initialStage = "질의 분석 중") {
     wrapper,
     bubble,
     label: bubble.querySelector(".progress-label"),
+    streamText: "",
   };
 }
 
@@ -231,6 +232,16 @@ function finalizeProgressBubble(progressBubble, finalText, reasoning = null) {
   }
   progressBubble.bubble.classList.remove("loading");
   appendRichText(progressBubble.bubble, finalText);
+}
+
+function appendProgressToken(progressBubble, token) {
+  if (!progressBubble?.bubble || !token) {
+    return;
+  }
+  progressBubble.streamText = `${progressBubble.streamText || ""}${token}`;
+  progressBubble.bubble.classList.remove("loading");
+  progressBubble.bubble.textContent = progressBubble.streamText;
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function stopCurrentGeneration() {
@@ -707,6 +718,8 @@ async function sendChat(messageText) {
     return;
   }
 
+  abortStarterSummaryStreams();
+  starterSummaryRequestVersion += 1;
   showStarters = false;
   hideStarterCardsImmediately();
 
@@ -721,7 +734,7 @@ async function sendChat(messageText) {
   renderMessages();
 
   userInputEl.value = "";
-  const progressBubble = appendProgressBubble("질의 분석 중");
+  const progressBubble = appendProgressBubble("도구 실행 계획 수립 중");
   const abortController = new AbortController();
   currentStreamAbortController = abortController;
   stoppedByUser = false;
@@ -757,6 +770,23 @@ async function sendChat(messageText) {
         const stage = (data?.stage || "").trim();
         const label = data?.label || STAGE_LABELS[stage] || "답변 생성 중";
         setProgressStage(progressBubble, label);
+        return;
+      }
+      if (eventName === "plan") {
+        const useVdb = Boolean(data?.use_vdb);
+        const usePdf = Boolean(data?.use_pdf);
+        const reasons = Array.isArray(data?.reasons) ? data.reasons.map((item) => String(item || "").trim()).filter(Boolean) : [];
+        const summary = `계획: ${useVdb ? "VDB" : "VDB 생략"} / ${usePdf ? "PDF" : "PDF 생략"}`;
+        const detail = reasons.length > 0 ? ` (${reasons[0]})` : "";
+        setProgressStage(progressBubble, `${summary}${detail}`);
+        return;
+      }
+      if (eventName === "token") {
+        const token = String(data?.token || "");
+        if (!token) {
+          return;
+        }
+        appendProgressToken(progressBubble, token);
         return;
       }
       if (eventName === "final") {

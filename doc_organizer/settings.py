@@ -70,7 +70,9 @@ class IngestionSettings:
     sparse_weight: float = 0.3
     llm_provider: str = "gemini"
     qa_model: str = "qwen3:latest"
-    ollama_reasoning: bool | str | None = None
+    starter_summary_model: str = "gemma3:4b-cloud"
+    qa_ollama_reasoning: bool | str | None = None
+    starter_ollama_reasoning: bool | str | None = None
     gemini_model: str = "gemini-2.0-flash"
     gemini_api_key: str | None = None
     redis_url: str = "redis://localhost:6379/0"
@@ -98,9 +100,15 @@ class IngestionSettings:
     def from_env(cls) -> IngestionSettings:
         _load_dotenv()
         qa_model = os.getenv("QA_MODEL", "qwen3:latest")
-        ollama_reasoning = cls._parse_ollama_reasoning(
-            os.getenv("OLLAMA_REASONING"),
-            qa_model=qa_model,
+        starter_summary_model = os.getenv("STARTER_SUMMARY_MODEL", "").strip() or qa_model
+        legacy_reasoning = os.getenv("OLLAMA_REASONING")
+        qa_ollama_reasoning = cls._parse_ollama_reasoning(
+            os.getenv("QA_OLLAMA_REASONING", legacy_reasoning),
+            model_name=qa_model,
+        )
+        starter_ollama_reasoning = cls._parse_ollama_reasoning(
+            os.getenv("STARTER_OLLAMA_REASONING", legacy_reasoning),
+            model_name=starter_summary_model,
         )
         return cls(
             docs_dir=Path(os.getenv("DOCS_DIR", "src_docs")),
@@ -122,7 +130,9 @@ class IngestionSettings:
             sparse_weight=float(os.getenv("SPARSE_WEIGHT", "0.3")),
             llm_provider=os.getenv("LLM_PROVIDER", "gemini"),
             qa_model=qa_model,
-            ollama_reasoning=ollama_reasoning,
+            starter_summary_model=starter_summary_model,
+            qa_ollama_reasoning=qa_ollama_reasoning,
+            starter_ollama_reasoning=starter_ollama_reasoning,
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
@@ -175,10 +185,10 @@ class IngestionSettings:
     def _parse_ollama_reasoning(
         raw_value: str | None,
         *,
-        qa_model: str,
+        model_name: str,
     ) -> bool | str | None:
         if raw_value is None:
-            model = (qa_model or "").strip().lower()
+            model = (model_name or "").strip().lower()
             if model.startswith("gpt-oss"):
                 return "high"
             return None

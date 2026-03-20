@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import tempfile
 import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -260,14 +261,103 @@ class ArxivPdfEnricher:
             from glmocr import GlmOcr
         except Exception as exc:
             raise RuntimeError("glmocr import failed. Install glmocr to enable PDF enrichment.") from exc
-        with GlmOcr(
-            config_path=self.settings.ocr_config_path,
-            mode="selfhosted",
-            model=self.settings.arxiv_pdf_ocr_model,
-        ) as parser:
-            result = parser.parse(str(pdf_path))
-            text = self._extract_text(result.json_result, result.markdown_result)
-        return text
+        try:
+            from pdf2image import convert_from_path
+        except Exception as exc:
+            raise RuntimeError(
+                "pdf2image import failed. Install pdf2image to enable PDF page conversion."
+            ) from exc
+        with tempfile.TemporaryDirectory(prefix="arxiv_pdf_pages_") as temp_dir:
+            page_images = convert_from_path(str(pdf_path))
+            if not page_images:
+                return ""
+
+            max_chars = max(1, self.settings.arxiv_pdf_extract_max_chars)
+            page_texts: list[str] = []
+            total_chars = 0
+            with GlmOcr(
+                config_path=self.settings.ocr_config_path,
+                mode="selfhosted",
+                model=self.settings.arxiv_pdf_ocr_model,
+            ) as parser:
+                for idx, page_image in enumerate(page_images, start=1):
+                    page_path = Path(temp_dir) / f"page_{idx:04d}.png"
+                    page_image.save(page_path, format="PNG")
+                    try:
+                        result = parser.parse(str(page_path))
+                    except Exception as exc:
+                        logger.warning(
+                            "arxiv_pdf_ocr_page_failed path=%s page=%s err=%s",
+                            pdf_path,
+                            idx,
+                            exc,
+                        )
+                        result = self._retry_page_with_fallback_image(
+                            page_image=page_image,
+                            temp_dir=Path(temp_dir),
+                            page_idx=idx,
+                            pdf_path=pdf_path,
+                        )
+                        if result is None:
+                            continue
+
+                    text = self._extract_text(result.json_result, result.markdown_result)
+                    if text:
+                        page_texts.append(text)
+                        total_chars += len(text)
+                    if total_chars >= max_chars:
+                        break
+
+        return "\n\n".join(page_texts).strip()
+
+    def _retry_page_with_fallback_image(
+        self,
+        *,
+        page_image: Any,
+        temp_dir: Path,
+        page_idx: int,
+        pdf_path: Path,
+    ) -> Any | None:
+        try:
+            from glmocr import GlmOcr
+        except Exception as exc:
+            logger.warning(
+                "arxiv_pdf_ocr_retry_import_failed path=%s page=%s err=%s",
+                pdf_path,
+                page_idx,
+                exc,
+            )
+            return None
+
+        fallback_path = temp_dir / f"page_{page_idx:04d}_fallback.jpg"
+        try:
+            fallback_image = page_image.convert("RGB")
+            fallback_image.thumbnail((1400, 1400))
+            fallback_image.save(fallback_path, format="JPEG", quality=90)
+        except Exception as exc:
+            logger.warning(
+                "arxiv_pdf_ocr_retry_image_build_failed path=%s page=%s err=%s",
+                pdf_path,
+                page_idx,
+                exc,
+            )
+            return None
+
+        try:
+            with GlmOcr(
+                config_path=self.settings.ocr_config_path,
+                mode="selfhosted",
+                model=self.settings.arxiv_pdf_ocr_model,
+            ) as retry_parser:
+                return retry_parser.parse(str(fallback_path))
+        except Exception as exc:
+            logger.warning(
+                "arxiv_pdf_ocr_retry_failed path=%s page=%s err=%s",
+                pdf_path,
+                page_idx,
+                exc,
+            )
+            return None
 
     @staticmethod
     def _extract_text(ocr_json: Any, markdown_result: str | None) -> str:
